@@ -1,6 +1,7 @@
 # loeuc-core
 
-Kotlin Multiplatform decoders for electric-unicycle and charger Bluetooth traffic.
+Kotlin Multiplatform decoders and an alert engine for electric-unicycle and charger Bluetooth
+traffic.
 
 Give it the bytes your BLE stack delivered; get back typed telemetry. The library never opens a
 connection, never writes to a characteristic, never touches storage and has no UI. That is a
@@ -18,6 +19,10 @@ session.telemetry[DeviceMetric.MotorTemperatureC] // null - this firmware does n
 
 A metric that comes back `null` was not reported. It is never a zero standing in for "unknown",
 which is the distinction that decides whether an app can show a number at all.
+
+**[docs/how-it-works.md](docs/how-it-works.md)** is the one page to read before integrating: what
+`ingest` accepts, what it returns, why `telemetry` holds a level rather than a stream, what the
+library retains, and where the threading and clock boundaries are.
 
 ## What it decodes
 
@@ -38,10 +43,31 @@ confirmed reading, the code says so at the line that decodes it. Comments occasi
 `docs/<brand>-protocol-notes.md`; those are the maintainer's research notes and are not part of
 this repository.
 
+## Alerts
+
+Decoding is half of it. The other half is a rules engine over the decoded values: thresholds
+with hysteresis and a minimum hold time, one voice at a time across competing alerts, and alarms
+that ramp - beeping faster and higher as a value climbs, then holding one continuous tone near
+the top.
+
+```kotlin
+val engine = AlertEngine(
+    voicePublisher = { voice -> audio.play(voice) },
+    alertSource = { myStore.enabledAlerts() },
+)
+
+engine.processTelemetry(update.snapshot)
+```
+
+The engine stores nothing and makes no sound: it evaluates the alerts you hand it and publishes
+the one that should be heard. Where rules live, how they are edited and how a tone is
+synthesised stay with your application. `examples/jvm` ramps one alert from silence to a
+continuous tone in six lines of output.
+
 ## Modules
 
-- `loeuc-core` - engines, the neutral telemetry model, sessions, the alert data model. No
-  dependencies beyond the Kotlin standard library.
+- `loeuc-core` - protocol engines, the neutral telemetry model, sessions, and the alert model
+  and rules engine. No dependencies beyond the Kotlin standard library.
 - `loeuc-coroutines` - one adapter that turns a `Flow<ByteArray>` transport into a flow of typed
   frames. Optional, and the only place kotlinx-coroutines appears.
 
@@ -61,7 +87,8 @@ build. Or vendor the directory and `include(":loeuc-core")` directly - that is w
 application this was extracted from does, and it is why the library is the same source the app
 compiles rather than a copy that drifts out of date.
 
-`examples/` has a runnable JVM program and the Android and iOS integration boundaries.
+`examples/` has a runnable JVM program and the Android and iOS integration boundaries;
+`docs/how-it-works.md` explains the model behind them.
 
 ## Writing to a wheel
 

@@ -5,6 +5,17 @@ package example
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
+import pw.vasilevskiy.loeuc.shared.alerts.engine.AlertEngine
+import pw.vasilevskiy.loeuc.shared.alerts.model.AccelerationCurve
+import pw.vasilevskiy.loeuc.shared.alerts.model.Alert
+import pw.vasilevskiy.loeuc.shared.alerts.model.AlertType
+import pw.vasilevskiy.loeuc.shared.alerts.model.AlertVoice
+import pw.vasilevskiy.loeuc.shared.alerts.model.ComparisonOperator
+import pw.vasilevskiy.loeuc.shared.alerts.model.ConditionTemplate
+import pw.vasilevskiy.loeuc.shared.alerts.model.MetricId
+import pw.vasilevskiy.loeuc.shared.alerts.model.SingleCondition
+import pw.vasilevskiy.loeuc.shared.alerts.model.SoundPattern
+import pw.vasilevskiy.loeuc.shared.alerts.model.SoundStep
 import pw.vasilevskiy.loeuc.shared.api.ChargerProtocol
 import pw.vasilevskiy.loeuc.shared.api.ChargerSession
 import pw.vasilevskiy.loeuc.shared.api.DeviceFrame
@@ -32,6 +43,7 @@ private const val HW_CHARGER_NOTIFICATION =
 fun main() {
     decodeAWheelNotification()
     decodeAChargerNotification()
+    rampAnAlarmAsSpeedRises()
     inspectAWriteCommandWithoutSendingIt()
     runBlocking { turnATransportFlowIntoFrames() }
 }
@@ -75,6 +87,68 @@ private fun decodeAChargerNotification() {
     )
     println()
 }
+
+/**
+ * An alert is a rule over decoded telemetry. This one watches speed above 40 km/h and ramps:
+ * the beeping gets faster and higher as the value climbs, and past 90% of the way to 60 km/h it
+ * stops being beeping at all and becomes one continuous tone.
+ *
+ * The engine stores nothing. It evaluates the alerts it is handed - here through an
+ * `alertSource` lambda - and publishes the one voice that should be sounding. Turning that
+ * voice into audio is the application's job; `VoiceTimeline` in the library samples it.
+ */
+private fun rampAnAlarmAsSpeedRises() {
+    var voice: AlertVoice? = null
+    val engine = AlertEngine(
+        voicePublisher = { voice = it },
+        alertSource = { listOf(speedRamp()) },
+    )
+
+    println("== Alert")
+    for (speed in listOf(35.0, 42.0, 50.0, 58.0)) {
+        val snapshot = DeviceTelemetry.of(DeviceMetric.SpeedKmh to speed)
+            .toSnapshot(timestampMs = 1_000L + (speed * 100).toLong())
+        val events = engine.processTelemetry(snapshot)
+
+        val sounding = voice
+        val state = when {
+            sounding == null -> "silent"
+            sounding.continuous -> "continuous tone, pitch x%.2f".format(sounding.pitchRatio)
+            else -> "beeping every %4d ms, pitch x%.2f".format(sounding.intervalMs, sounding.pitchRatio)
+        }
+        println("  %5.1f km/h  events=%d  %s".format(speed, events.size, state))
+    }
+    println()
+}
+
+/** Speed above 40 km/h, ramping to a continuous tone as it approaches 60. */
+private fun speedRamp(): Alert = Alert(
+    id = "speed_ramp",
+    name = "Speed",
+    priority = 1,
+    type = AlertType.Accelerating(
+        minIntervalMs = 60L,
+        maxIntervalMs = 1_200L,
+        curve = AccelerationCurve.LINEAR,
+        pitchRiseRatio = 2.33,
+        continuousFromRatio = 0.9,
+    ),
+    conditionItems = listOf(
+        SingleCondition(
+            id = "over_40",
+            metric = MetricId.SPEED_KMH,
+            template = ConditionTemplate(
+                id = "tpl_speed",
+                name = "over 40",
+                operator = ComparisonOperator.GREATER_THAN,
+                targetValue = 40.0,
+                resetValue = 38.0,
+                accelMaxTargetValue = 60.0,
+            ),
+        ),
+    ),
+    soundPattern = SoundPattern("speed_beep", "beep", listOf(SoundStep())),
+)
 
 /**
  * Write commands are bytes, never an action: the library hands them over and the caller decides

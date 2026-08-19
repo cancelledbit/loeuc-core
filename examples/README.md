@@ -9,8 +9,8 @@
 ```
 
 It decodes one Leaperkim Lynx S notification and one HW smart charger notification - both are
-byte-for-byte fixtures from the library's own tests - inspects a write command without sending
-it, and runs the `Flow` adapter from `loeuc-coroutines`. Output:
+byte-for-byte fixtures from the library's own tests - ramps an alert as speed rises, inspects a
+write command without sending it, and runs the `Flow` adapter from `loeuc-coroutines`. Output:
 
 ```
 == Wheel
@@ -30,6 +30,12 @@ frame recognised: true
   ChargeCurrentA           0.0
   ChargerTemperatureC      17.3125
 
+== Alert
+   35.0 km/h  events=0  silent
+   42.0 km/h  events=1  beeping every 1086 ms, pitch x1.13
+   50.0 km/h  events=1  beeping every  630 ms, pitch x1.67
+   58.0 km/h  events=1  continuous tone, pitch x2.20
+
 == Command
 purpose:  light_on
 status:   UNTESTED
@@ -42,6 +48,10 @@ frames: 1, first frame 77 bytes
 
 `MotorTemperatureC` printing `-` is the point of the absent-value contract: this firmware does
 not measure motor temperature, and the library will not invent a zero for it.
+
+The alert section is the ramp in one screen: the same rule beeps slowly at 42 km/h, twice as
+often and higher at 50, and stops beeping altogether at 58 - past 90% of the way to its ceiling
+it holds one continuous tone. A rider hears where they are on the curve without reading anything.
 
 ## Android
 
@@ -64,8 +74,9 @@ override fun onCharacteristicChanged(
 }
 ```
 
-Ingest is synchronous and allocates only what it decodes, so calling it straight from the BLE
-callback thread is fine; keep rendering off it as you would anyway.
+Ingest is synchronous and never waits on the device, so calling it straight from the BLE
+callback thread is fine; keep rendering off it as you would anyway. One session per device, and
+do not feed one from two threads at once - see `docs/how-it-works.md`.
 
 ## iOS
 

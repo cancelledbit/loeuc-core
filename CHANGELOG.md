@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The alert engine is part of the library: conditions with hysteresis and hold time, the
+  one-voice arbiter, ramping cadence and the voice timeline. It stores nothing - alerts arrive
+  through the new `AlertSource`, an explicit argument, or `setAlerts` - so persistence, editing
+  and migrations stay with the consumer.
+
 - Relicensed under MIT.
 - Write commands are public again, behind the `@ExperimentalWriteApi` opt-in marker, and
   `ExperimentalCommands` now delegates to the protocol engines instead of carrying its own copy
