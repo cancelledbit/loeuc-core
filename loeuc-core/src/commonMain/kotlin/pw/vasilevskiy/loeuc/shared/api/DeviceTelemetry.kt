@@ -22,7 +22,7 @@ class DeviceTelemetry private constructor(val values: Map<DeviceMetric, Double>)
         DeviceTelemetry(values + newer.values)
 
     /**
-     * Projects onto the sixteen [MetricId] values the alert engine understands.
+     * Projects onto the [MetricId] values the alert engine understands.
      *
      * @param timestampMs the device's clock, never the phone's - `AlertEngine` reads durations
      *   and cooldowns from it, which is what makes accelerated dump playback behave like a ride.

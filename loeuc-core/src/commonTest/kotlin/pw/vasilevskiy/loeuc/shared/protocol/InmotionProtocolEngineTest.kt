@@ -8,6 +8,15 @@ import kotlin.test.assertTrue
 
 class InmotionProtocolEngineTest {
     @Test
+    fun exposesTheDecodedModelForPlatformCatalogueLookup() {
+        val engine = InmotionProtocolEngine()
+
+        engine.consume("AAAA110882010206010201009C".bytes())
+
+        assertEquals("V11", engine.modelName())
+    }
+
+    @Test
     fun buildsReadOnlyProtocolCommands() {
         val engine = InmotionProtocolEngine()
 

@@ -7,6 +7,15 @@ import kotlin.test.assertTrue
 
 class BegodeProtocolEngineTest {
     @Test
+    fun capturesModelNameResponseOutsideBinaryTelemetryFrames() {
+        val engine = BegodeProtocolEngine()
+
+        engine.consume("NAME:ET MAX\r\n".encodeToByteArray())
+
+        assertEquals("ET MAX", engine.modelName())
+    }
+
+    @Test
     fun modernBegodeKeepsHardwarePwmAsPercent() {
         val engine = BegodeProtocolEngine()
         val battery = begodeFrame(type = 1, page = 0).apply {
@@ -81,10 +90,12 @@ class BegodeProtocolEngineTest {
     }
 
     @Test
-    fun modernBegodeBatteryPercentFallsBackToVoltageBucketsNotLegacyVoltageClass() {
+    fun modernBegodeChargeStaysUnknownWithoutASeriesCellCount() {
         val engine = BegodeProtocolEngine().apply {
-            // Simulates a device that never had its (unrelated legacy-only) voltage
-            // class touched, still defaulting to 100.8V.
+            // A device that never had its (legacy-only) voltage class touched, still on the
+            // 100.8V default. That default is nobody's choice and must not become a divider:
+            // this pack reads 150V, which 100.8/4.2 = 24S would call 6.25V per cell and clip
+            // to a full battery.
             setLegacyVoltageClassMaxVoltage(100.8)
         }
         val battery = begodeFrame(type = 1, page = 0).apply {
@@ -95,11 +106,114 @@ class BegodeProtocolEngineTest {
 
         assertFalse(telemetry.isLegacy)
         assertEquals(150.0, telemetry.voltage, 0.0001)
-        // 150V falls in the 145..180V bucket -> 40S -> 3.75V/cell -> 56.25% on the discharge
-        // curve (3.70V = 50%, 3.78V = 60%, interpolated in between).
-        // If the legacy voltage class (100.8V -> 24S) leaked into this modern
-        // fallback, cellVoltage would be 150/24 = 6.25V, clamping to 100%.
-        assertEquals(56.25, telemetry.batteryPercent, 0.0001)
+        // 150V is a full 36S and equally a 40S at 3.75V per cell. Nothing here can tell them
+        // apart, so the charge is unknown rather than invented.
+        assertTrue(telemetry.batteryPercent.isNaN())
+    }
+
+    @Test
+    fun smartBmsCellsOutrankTheCatalogueCountAndNeedNoModelAtAll() {
+        // Current Begodes report their own cells (type=2/3 frames), and then no model is
+        // needed for charge at all: the pack is measured rather than inferred. The catalogue
+        // count here is deliberately wrong - had it won, 185V over 24 cells would read
+        // 7.7V per cell and clip to a full battery.
+        val engine = BegodeProtocolEngine().apply { setPackSeriesCells(24) }
+        var telemetry: BegodeTelemetry? = null
+
+        repeat(7) { page ->
+            val frame = begodeFrame(type = 2, page = page).apply {
+                repeat(8) { index ->
+                    val cellIndex = page * 8 + index
+                    // 3.70V per cell is exactly 50% on the discharge curve.
+                    putUInt16Be(offset = 2 + index * 2, value = if (cellIndex < 50) 3_700 else 0)
+                }
+            }
+            telemetry = engine.consume(frame)
+        }
+
+        val value = requireNotNull(telemetry)
+        assertEquals(50, value.cellVoltages.size)
+        assertEquals(185.0, value.voltage, 0.0001)
+        assertEquals(50.0, value.batteryPercent, 0.0001)
+    }
+
+    @Test
+    fun modernBegodeChargeSurvivesReconnectingOnAHalfEmptyPack() {
+        // The T4 Max report: the rider reconnects mid-ride with the pack already under 90V.
+        // A fresh engine has no history, and the old voltage-bucket guess called anything under
+        // 90V a 20S pack - 89.5/20 = 4.475V per cell, clipped to 100%, for the rest of the
+        // session. With the catalogue count there is no history to lose.
+        val engine = BegodeProtocolEngine().apply { setPackSeriesCells(24) }
+        val frame = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 895) // 89.5V
+        }
+
+        val telemetry = requireNotNull(engine.consume(frame))
+
+        // 89.5/24 = 3.7292V/cell -> 53.65% on the discharge curve.
+        assertEquals(53.6458, telemetry.batteryPercent, 0.0001)
+    }
+
+    @Test
+    fun modernBegodeUsesThePackSeriesCountItWasGivenInsteadOfGuessingFromVoltage() {
+        val engine = BegodeProtocolEngine().apply {
+            // What the retail catalogue says about a T4: 24S4P, 1800 Wh.
+            setPackSeriesCells(24)
+        }
+        val battery = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 891) // 89.1V, no cell frames received yet
+        }
+
+        val telemetry = requireNotNull(engine.consume(battery))
+
+        // 89.1/24 = 3.7125V/cell -> 51.56%. The voltage buckets would have called this 20S,
+        // 4.455V/cell, and clipped it to a full battery.
+        assertEquals(51.5625, telemetry.batteryPercent, 0.0001)
+    }
+
+    @Test
+    fun modernBegodeChargeOnlyFallsAsThePackDrains() {
+        // The whole point of a fixed series-cell count: charge tracks the pack down without
+        // stepping back up. The old voltage buckets broke exactly here, at the 90V line.
+        val engine = BegodeProtocolEngine().apply { setPackSeriesCells(24) }
+
+        val full = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 946) // 94.6V -> 79.17%
+        }
+        val sagging = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 891) // 89.1V, across the old bucket boundary
+        }
+        val emptier = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 855) // 85.5V
+        }
+
+        val start = requireNotNull(engine.consume(full))
+        val dip = requireNotNull(engine.consume(sagging))
+        val end = requireNotNull(engine.consume(emptier))
+
+        assertEquals(79.1666, start.batteryPercent, 0.0001)
+        assertEquals(51.5625, dip.batteryPercent, 0.0001)
+        assertEquals(31.7857, end.batteryPercent, 0.0001)
+        assertTrue(end.batteryPercent < dip.batteryPercent)
+        assertTrue(dip.batteryPercent < start.batteryPercent)
+    }
+
+    @Test
+    fun legacyBegodeKeepsTheRidersVoltageClassOverTheCatalogue() {
+        val engine = BegodeProtocolEngine().apply {
+            setLegacyVoltageClassMaxVoltage(84.0)
+            setPackSeriesCells(24)
+        }
+        val frame = begodeFrame(type = 0, page = 24).apply {
+            putUInt16Be(offset = 2, value = 5_000) // 50.00 * 1.25 = 62.5V
+            putInt16Be(offset = 4, value = 100)
+        }
+
+        val telemetry = requireNotNull(engine.consume(frame))
+
+        // 84V class -> 20S -> 62.5/20 = 3.125V/cell -> 3.57%. The rider picked the class by
+        // hand; a catalogue guess must not overrule it.
+        assertEquals(3.5714, telemetry.batteryPercent, 0.0001)
     }
 
     @Test
@@ -344,6 +458,67 @@ class BegodeProtocolEngineTest {
         assertEquals(0.0, engine.batteryPercentFromCellVoltage(2.50), 0.0001)
         // Below 3.35V no longer collapses to zero: a cell at 3.2V is not empty.
         assertTrue(engine.batteryPercentFromCellVoltage(3.20) > 0.0)
+    }
+
+
+    // The three frames below are lifted verbatim from capture
+    // `385CFBC9BF07/20260727_084903`, twenty thousand frames of a real ride. Every moving sample
+    // of that ride carries a negative speed word, so these also pin down that the sign is read
+    // against the direction of travel and not on its own.
+
+    /** Speed -20.23 km/h, current word -22.80 A: the two agree, so the pack is driving. */
+    private val legacyDriving = byteArrayOf(
+        0x55, 0xAA.toByte(), 0x17, 0xC5.toByte(), 0xFD.toByte(), 0xCE.toByte(), 0x00, 0x55,
+        0x04, 0xE1.toByte(), 0xF7.toByte(), 0x18, 0xF9.toByte(), 0xB2.toByte(), 0x10, 0x89.toByte(),
+        0x00, 0x08, 0x00, 0x18, 0x5A, 0x5A, 0x5A, 0x5A,
+    )
+
+    /** Speed -22.93 km/h, current word +8.20 A: they disagree, so the motor is braking. */
+    private val legacyBraking = byteArrayOf(
+        0x55, 0xAA.toByte(), 0x17, 0xCF.toByte(), 0xFD.toByte(), 0x83.toByte(), 0x00, 0x56,
+        0x04, 0xFE.toByte(), 0x03, 0x34, 0xF9.toByte(), 0xAD.toByte(), 0x10, 0x89.toByte(),
+        0x00, 0x08, 0x00, 0x18, 0x5A, 0x5A, 0x5A, 0x5A,
+    )
+
+    /** Standstill. No direction to agree with, and a balancing wheel still draws. */
+    private val legacyStationary = byteArrayOf(
+        0x55, 0xAA.toByte(), 0x17, 0xB1.toByte(), 0x00, 0x00, 0x00, 0x54,
+        0x1B, 0xCE.toByte(), 0x06, 0xB8.toByte(), 0xFA.toByte(), 0x70, 0x10, 0x89.toByte(),
+        0x00, 0x08, 0x00, 0x18, 0x5A, 0x5A, 0x5A, 0x5A,
+    )
+
+    @Test
+    fun legacyBegodeDrivingReportsPowerLeavingThePack() {
+        val telemetry = requireNotNull(BegodeProtocolEngine().consume(legacyDriving))
+
+        assertTrue(telemetry.isLegacy)
+        assertTrue(telemetry.power > 0.0, "driving must draw, was ${telemetry.power}")
+        assertTrue(telemetry.current > 0.0, "driving must draw, was ${telemetry.current}")
+    }
+
+    @Test
+    fun legacyBegodeBrakingReportsPowerReturningToThePack() {
+        val telemetry = requireNotNull(BegodeProtocolEngine().consume(legacyBraking))
+
+        assertTrue(telemetry.power < 0.0, "braking must return, was ${telemetry.power}")
+        assertTrue(telemetry.current < 0.0, "braking must return, was ${telemetry.current}")
+    }
+
+    @Test
+    fun legacyBegodeKeepsPhaseCurrentAndApparentPowerAsMagnitudes() {
+        val telemetry = requireNotNull(BegodeProtocolEngine().consume(legacyBraking))
+
+        assertTrue(telemetry.phaseCurrent > 0.0, "phase current is effort, not direction")
+        assertTrue(telemetry.apparentPower > 0.0, "apparent power is a magnitude by definition")
+        assertEquals(telemetry.apparentPower, -telemetry.power, 0.0001)
+    }
+
+    @Test
+    fun legacyBegodeStandstillCountsAsDriving() {
+        val telemetry = requireNotNull(BegodeProtocolEngine().consume(legacyStationary))
+
+        assertEquals(0.0, telemetry.speedKmh, 0.0001)
+        assertTrue(telemetry.power >= 0.0, "a balancing wheel draws, was ${telemetry.power}")
     }
 
     private fun begodeFrame(type: Int, page: Int): ByteArray {

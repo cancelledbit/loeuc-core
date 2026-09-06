@@ -42,6 +42,25 @@ sealed interface AlertType {
         val pitchRiseRatio: Double = 1.0,
         val continuousFromRatio: Double = 0.9,
     ) : AlertType
+
+    /**
+     * Says the metric and its value out loud instead of sounding a pattern.
+     *
+     * Always fires once, exactly like [OneShot], and for the same reason: a phrase that
+     * repeats is not information, it is noise, and a phrase that speeds up cannot exist at
+     * all. To hear a metric more than once per ride, give its condition a
+     * [ConditionTemplate.repeatEveryValue] step - the rearm belongs to the condition, not to
+     * the way the alert sounds.
+     *
+     * A spoken alert never competes for the single tone slot. It waits instead: see
+     * [pw.vasilevskiy.loeuc.shared.alerts.engine.AnnouncementArbiter].
+     *
+     * @param phrase the rider's template, for example "Скорость {значение}". Placeholders are
+     *   filled by [AnnouncementComposer]; see [MetricSpeech] for what a new alert starts from.
+     */
+    data class Spoken(
+        val phrase: String = ""
+    ) : AlertType
 }
 
 enum class AccelerationCurve {

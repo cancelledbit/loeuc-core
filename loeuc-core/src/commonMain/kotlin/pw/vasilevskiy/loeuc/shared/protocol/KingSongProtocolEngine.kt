@@ -48,6 +48,7 @@ class KingSongProtocolEngine {
      * `0xA9` sensor stands in until the first `0xB9` frame arrives and then steps aside.
      */
     private var sawRideStatsTemperature = false
+    private var decodedModelName: String? = null
 
     private val bmsPages = KingSongBmsPages()
 
@@ -55,6 +56,7 @@ class KingSongProtocolEngine {
         buffer = byteArrayOf()
         state = KingSongTelemetry()
         sawRideStatsTemperature = false
+        decodedModelName = null
         bmsPages.clear()
     }
 
@@ -65,6 +67,9 @@ class KingSongProtocolEngine {
     fun bmsPacks(): List<KingSongBmsPack> {
         return bmsPages.packs()
     }
+
+    /** Name/type response (`0xBB`) used by platform battery-catalogue lookup. */
+    fun modelName(): String? = decodedModelName
 
     fun initialReadCommand(): ByteArray {
         return simpleCommand(command = KINGSONG_COMMAND_SERIAL_READ)
@@ -122,6 +127,14 @@ class KingSongProtocolEngine {
 
     private fun processFrame(frame: ByteArray) {
         bmsPages.accept(frame)
+        if (frame.isStandardKingSongFrame() && frame.command() == KINGSONG_COMMAND_NAME_RESPONSE) {
+            decodedModelName = frame.copyOfRange(2, 16)
+                .takeWhile { it != 0.toByte() }
+                .toByteArray()
+                .decodeToString()
+                .trim()
+                .takeIf { it.isNotEmpty() }
+        }
         state = when {
             frame.isStandardKingSongFrame() && frame.command() == KINGSONG_COMMAND_LIVE_TELEMETRY -> {
                 val voltage = frame.int16Le(offset = 2) / 100.0
@@ -473,6 +486,7 @@ private const val KINGSONG_SIMPLE_FRAME_LENGTH = 0x14
 private const val KINGSONG_COMMAND_HEARTBEAT = 0x00
 private const val KINGSONG_COMMAND_SERIAL_READ = 0x98
 private const val KINGSONG_COMMAND_NAME_READ = 0x63
+private const val KINGSONG_COMMAND_NAME_RESPONSE = 0xBB
 private const val KINGSONG_COMMAND_VERSION_READ = 0x9B
 private const val KINGSONG_COMMAND_INITIAL_READ = 0x5E
 private const val KINGSONG_COMMAND_TRIP_READ = 0x4B

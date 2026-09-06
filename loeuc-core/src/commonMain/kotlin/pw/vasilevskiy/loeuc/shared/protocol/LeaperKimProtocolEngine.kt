@@ -2,6 +2,7 @@ package pw.vasilevskiy.loeuc.shared.protocol
 
 import pw.vasilevskiy.loeuc.shared.api.ExperimentalWriteApi
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 data class LeaperKimTelemetry(
     val speedKmh: Double,
@@ -13,6 +14,7 @@ data class LeaperKimTelemetry(
     val temperature: Double,
     val mosTemperature: Double,
     val motorTemperature: Double,
+    val coilTemperature: Double = Double.NaN,
     val batteryPercent: Double,
     val tripDistanceMeters: Double,
     val totalDistanceMeters: Double,
@@ -142,6 +144,24 @@ class LeaperKimProtocolEngine {
         return allSettingsCapabilities().filter { it.isSupported }
     }
 
+    /** Model identity carried by the firmware version field, independent of BMS page support. */
+    fun modelName(): String? = when (hardwareCode) {
+        "0010" -> "Sherman"
+        "0011" -> "Sherman Max"
+        "0020" -> "Abrams"
+        // 0030 is Sherman-S, which has no unambiguous catalogue entry yet.
+        "0040" -> "Patton"
+        "0050" -> "Lynx"
+        "0060" -> "Sherman-L"
+        "0070" -> "Patton-S"
+        "0080" -> "Oryx"
+        "0090" -> "Lynx-S"
+        "5010" -> "Apex"
+        "5020" -> "Aero"
+        "5030" -> "Aeon"
+        else -> null
+    }
+
     /**
      * Full capability list including fields the current wheel doesn't report this cycle
      * (isSupported=false, rawValue meaningless) - matches Android's WheelSettingCapability
@@ -156,7 +176,14 @@ class LeaperKimProtocolEngine {
             // Until then it stays
             // isSupported = false, which is how every platform already renders an absent field.
             if (capability.key == "angle_trim" && pedalAngleTrim.isFinite()) {
-                val raw = (pedalAngleTrim * 10.0).toInt().coerceIn(-80, 80)
+                // Rounded, not truncated. The wheel reports hundredths of a degree and the
+                // capability carries tenths, so half of every possible reading is not a whole
+                // tenth - a factory trim of -7.99 deg is a real value, not a rounding artefact.
+                // `toInt()` truncates toward zero, so 800 of the 1601 readings displayed a
+                // tenth closer to level than the wheel actually stood, and always in the same
+                // direction. Values this app wrote itself are whole tenths and survived either
+                // way, which is why it went unnoticed.
+                val raw = (pedalAngleTrim * 10.0).roundToInt().coerceIn(-80, 80)
                 capability.copy(rawValue = raw, isSupported = true)
             } else {
                 capability
@@ -235,6 +262,106 @@ class LeaperKimProtocolEngine {
         return payload.withCrc32()
     }
 
+    /**
+     * The frames that put a plugin into the wheel's second flash bank.
+     *
+     * A patched wheel carries a receiver that knows three things — unlock the flash, erase a page,
+     * write one halfword — and nothing else: no cursor, no state, no length field. The address
+     * rides in every frame, which is what keeps the receiver small enough to fit the ninety-six
+     * bytes the stock image has to spare. Ordering, erasing before writing and checking the result
+     * are therefore this side's job.
+     *
+     * The offset is in halfwords from the start of the bank, sixteen bits of it, which caps the
+     * whole plugin area at the 128 KB the budget allows and means no frame can reach the wheel's
+     * own filesystem at the far end of the flash. That area is sixty-four slots of one flash page,
+     * and the wheel calls every slot that carries the magic — so a plugin is installed *alongside*
+     * the others, not instead of them, and [slot] is which one this payload goes into. A plugin
+     * longer than a page simply covers the slots that follow.
+     *
+     * A stock wheel ignores every one of these frames: family `0x61` falls through its dispatch
+     * chain to the branch that does nothing.
+     */
+    @ExperimentalWriteApi
+    fun buildPluginUploadFrames(
+        payload: ByteArray,
+        slot: Int = 0,
+        pageSize: Int = PluginSlotBytes,
+    ): ByteArray {
+        require(payload.isNotEmpty()) { "empty plugin" }
+        require(pageSize > 0 && pageSize % 2 == 0) { "page size must be even" }
+        require(slot in 0 until PluginSlots) { "slot $slot is outside the $PluginSlots the wheel calls" }
+        val even = if (payload.size % 2 == 0) payload else payload + byteArrayOf(0xFF.toByte())
+        require(even.size <= PluginSlots * PluginSlotBytes - slot * PluginSlotBytes) {
+            "plugin does not fit the slots left from $slot"
+        }
+        val base = slot * PluginSlotBytes / 2
+
+        val stream = ArrayList<Byte>(even.size * 8)
+        fun frame(offsetHalfwords: Int, sub: Int, value: Int) {
+            stream += byteArrayOf(
+                'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+                0x10, 0x01, PluginLoaderFamily.toByte(),
+                (offsetHalfwords ushr 8).toByte(), offsetHalfwords.toByte(),
+                sub.toByte(), value.toByte(), (value ushr 8).toByte(),
+            ).withCrc32().toList()
+        }
+
+        fun halfword(index: Int): Int {
+            val at = index * 2
+            return (even[at].toInt() and 0xFF) or ((even[at + 1].toInt() and 0xFF) shl 8)
+        }
+
+        val halfwords = even.size / 2
+        frame(base, PluginLoaderUnlock, 0)
+
+        // Every page first, then every write. Erasing between writes would take the magic back
+        // out along with the page it sits in.
+        for (index in 0 until halfwords) {
+            if (index * 2 % pageSize == 0) {
+                frame(base + index, PluginLoaderErase, 0)
+            }
+        }
+
+        // The body, and only then the two halfwords the firmware recognises a plugin by. Until
+        // the magic lands there is no plugin in the bank: the hook finds erased flash, falls back
+        // to stock behaviour, and a link that drops mid-upload leaves a wheel that behaves exactly
+        // as it did before. Writing the magic first would arm the hook over an image that is
+        // mostly still erased flash, and it would call into it twice a second, and a power cycle
+        // would not clear it.
+        for (index in MagicHalfwords until halfwords) {
+            frame(base + index, PluginLoaderWrite, halfword(index))
+        }
+        for (index in 0 until minOf(MagicHalfwords, halfwords)) {
+            frame(base + index, PluginLoaderWrite, halfword(index))
+        }
+        return stream.toByteArray()
+    }
+
+    /**
+     * A command for one of the plugins the wheel is carrying.
+     *
+     * The receiver in the firmware recognises this subcommand and does exactly one thing with it:
+     * hand the frame to every installed plugin and stop looking. So the frame has to name its
+     * addressee itself — otherwise a command meant for one plugin is answered by all of them.
+     * [pluginId] is that name, `0` reaches everyone, and what [opcode] and [value] mean is between
+     * this side and that plugin. A wheel with no plugin installed drops the frame.
+     *
+     * The two bytes that carry a flash address for an upload are free here, which is where the id
+     * and the opcode ride; the value gets the two the payload always had.
+     */
+    @ExperimentalWriteApi
+    fun buildPluginCommandFrame(pluginId: Int, opcode: Int, value: Int): ByteArray {
+        require(pluginId in 0..0xFF) { "plugin id is one byte" }
+        require(opcode in 0..0xFF) { "opcode is one byte" }
+        require(value in 0..0xFFFF) { "value is one halfword" }
+        return byteArrayOf(
+            'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0x10, 0x01, PluginLoaderFamily.toByte(),
+            pluginId.toByte(), opcode.toByte(), PluginLoaderCall.toByte(),
+            value.toByte(), (value ushr 8).toByte(),
+        ).withCrc32()
+    }
+
     @ExperimentalWriteApi
     fun buildFixedShutdownTimerCommand(): ByteArray {
         return byteArrayOf(
@@ -244,6 +371,32 @@ class LeaperKimProtocolEngine {
             0x80.toByte(), 0x80.toByte(), 0x80.toByte(), 0x80.toByte(),
             0x01, 0x80.toByte(),
         ).withCrc32()
+    }
+
+    /**
+     * Whether the headlight can only be switched by the text command, because this wheel's
+     * firmware has no binary `0x0D` handler at all.
+     *
+     * Read out of the firmware images rather than guessed. Every LeaperKim build understands the
+     * text form; the binary family is the newer addition, and four hardware codes predate it:
+     *
+     * - `0010` Sherman, `0011` Sherman Max, `0020` Abrams, `0030` Sherman S: text only.
+     * - `0040` Patton: text plus the old `LkAp` frame.
+     * - `0050` Lynx: text plus both frames.
+     * - `0060` Sherman-L, `0070` Patton-S, `0090` Lynx-S: text plus the new `LdAp` frame.
+     *
+     * The marker check is the whole proof for the four: `sherman_max_1.1.7.bin` contains neither
+     * `LkAp` nor `LdAp` anywhere, so the frame this engine builds cannot be dispatched by
+     * anything, and the light button was silent. Its command dispatcher at `0x080041A0` compares
+     * the received text against a literal table and, on `SetLightON`, stores `1` into the light
+     * mode byte at `0x200002C1` (`SetLightOFF` stores `0`).
+     *
+     * Unknown hardware codes answer `false`: the binary frame is what every caller sent before,
+     * and a wheel this engine cannot identify is not the place to change that.
+     */
+    fun usesTextLightCommand(): Boolean = when (hardwareCode) {
+        "0010", "0011", "0020", "0030" -> true
+        else -> false
     }
 
     @ExperimentalWriteApi
@@ -373,27 +526,49 @@ class LeaperKimProtocolEngine {
         }
         readFirmwareVersion()?.let { firmwareVersion = it.toDouble() }
 
-        val phaseCurrent = abs(int16Be(16)) / 10.0
+        // `@16` is the q-axis (torque) current: `docs/leaperkim-lynxs-protocol.md` matched it
+        // against the diagnostic `AQ`, and decoding the co-stream out of the `882583F62376`
+        // captures shows `AQ` running -25.6..+49.2 A. So the word is signed, and the sign is the
+        // torque direction - see [powerFlowSign] for why it is read against the speed word rather
+        // than on its own.
+        val phaseCurrentRaw = int16Be(16)
+        val speedRaw = int16Be(6)
+        val phaseCurrent = abs(phaseCurrentRaw) / 10.0
         val outputRaw = uint16Be(34)
         val outputCurrent = phaseCurrent * outputRaw / 10_000.0
+        val flow = powerFlowSign(phaseCurrentRaw, speedRaw, TorqueSignConvention.AgreementIsBraking)
         return LeaperKimTelemetry(
-            speedKmh = abs(int16Be(6)) / 10.0,
+            speedKmh = abs(speedRaw) / 10.0,
             pwmPercent = outputRaw / 100.0,
             voltage = voltage,
             phaseCurrent = phaseCurrent,
-            outputCurrent = outputCurrent,
-            power = outputCurrent * voltage,
+            outputCurrent = flow * outputCurrent,
+            power = flow * outputCurrent * voltage,
             temperature = int16Be(18) / 100.0,
             mosTemperature = mosTemperature,
-            // The wheel does not report motor temperature at all. This used to read
-            // `int16Be(38) / 10`, which is zero at a standstill and a plausible-looking number
-            // under load. Disassembling firmware `0090.04` showed that the frame builder at
-            // `FUN_0801ABE8` takes those bytes from `0x2000058A` - the `AI` field of the
-            // diagnostic co-stream, outside the temperature block at `0x20005F0C`. Neither the
-            // measured motor probe (`0x20005F18`) nor the modelled coil temperature
-            // (`0x20005F1C`) is written into a `DC 5A 5C` frame: this firmware puts two
-            // temperatures on the wire, not four.
-            motorTemperature = Double.NaN,
+            // Stock firmware writes six `0x80` sentinel bytes into main-frame `@40..45` and puts
+            // no motor temperature on the wire. A patched build (see the "motor temperature onto
+            // the wire" note in the RE docs) replaces the first four of those with the measured
+            // motor probe (`0x20005F18`) at `@40..41` and the modelled coil (`0x20005F1C`) at
+            // `@42..43`, big-endian centidegrees.
+            //
+            // The guard is the wheel's own measuring range, not a round number. The firmware
+            // converts the probe through a 27-entry lookup at `0x080156F4` whose result is
+            // `23000 - 1000 * index` in centidegrees plus interpolation — so it reads from about
+            // -40 C at the cold end to about 220 C at the hot one, and cannot produce more.
+            // Anything outside that is the stock sentinel (`0x8080` -> -326.40 C) or noise.
+            //
+            // An earlier version cut this off at 200 C, and a patched wheel that got hotter than
+            // that simply stopped reporting: the reading was thrown away here rather than missing
+            // on the wire. A coil above 200 C is exactly when somebody wants to see the number.
+            motorTemperature = int16BeOrNull(40)
+                ?.div(100.0)
+                ?.takeIf { it in -40.0..MotorProbeCeilingCelsius }
+                ?: Double.NaN,
+            coilTemperature = int16BeOrNull(42)
+                ?.div(100.0)
+                ?.takeIf { it in -40.0..MotorProbeCeilingCelsius }
+                ?: Double.NaN,
             batteryPercent = batteryPercent,
             tripDistanceMeters = distance(8),
             totalDistanceMeters = distance(12),
@@ -567,7 +742,15 @@ class LeaperKimProtocolEngine {
             // a flat 100%. See docs/leaperkim-lynxs-protocol.md.
             "0070", "5020", "0040" -> 30
             "0080" -> 42
-            "0010", "0011" -> 24
+            // Sherman-s (0030) joins the 24S Shermans on the evidence of dump
+            // loeuc_882583F51F81_unknown_20260819_220233.jsonl (device LK8435, firmware 3015),
+            // which idles at 100.86 V on a pack its rider reports as fully charged: 4.2025 V per
+            // cell across 24, against an impossible-for-a-full-pack 3.362 V across 30. Without
+            // the entry the code fell through to guessSCountFromVoltage, whose "above 100.0 V
+            // means 30S" branch reads a *full* 24S pack as a nearly empty 30S one - the wheel
+            // showed 14.3% at 100.86 V. Abrams (0020) is the same generation and is suspected of
+            // the same fault, but no capture of one exists here, so it stays with the guess.
+            "0010", "0011", "0030" -> 24
             else -> {
                 reportedCellCounts.filterNotNull().maxOrNull() ?: guessSCountFromVoltage(voltageRaw / 100.0)
             }
@@ -614,15 +797,42 @@ private data class LeaperKimBmsProfile(
         get() = totalParallelStrings / batteryCount
 }
 
+/**
+ * Parallel counts come from a retail catalogue that publishes the pack string per model; see
+ * `WheelPackCatalogue`. Before it, they were derived from published pack energy on the assumption
+ * of Samsung 21700 cells at 5.0 Ah nominal - `P = Wh / (cells * 3.6 V * 5.0 Ah)` - and the
+ * catalogue confirmed every one of those:
+ *
+ *     model       Wh    cells   nominal Ah   P
+ *     Lynx        2700     36        20.8     4.17 -> 4
+ *     Lynx-S      2700     36        20.8     4.17 -> 4
+ *     Sherman-L   4000     36        30.9     6.17 -> 6
+ *     Patton-S    2220     30        20.6     4.11 -> 4
+ *     Oryx        4700     42        31.1     6.22 -> 6
+ *
+ * All five land within 4 % of a whole number and they all overshoot by the same amount, which is
+ * the rating being a shade optimistic against 5.0 Ah - so the formula reproduces rather than
+ * coincides. Sherman-L's 6P is stated outright by the vendor, which is the one independent check
+ * available, and it matches.
+ *
+ * Four of these were wrong before: Lynx, Sherman-L and Patton-S all carried 2, and Oryx 4. The
+ * value is a **pack total**; [LeaperKimBmsProfile.parallelStringsPerBattery] divides it by the
+ * battery count, so a Lynx is two batteries of 36S2P making 36S4P.
+ *
+ * Nosfet packs are left as they were: no published pack energy has been found for them, and the
+ * formula needs one. They are marked here so the gap is visible rather than assumed correct.
+ */
 private val LeaperKimBmsProfiles = mapOf(
-    "0050" to LeaperKimBmsProfile("leaperkim_0050", "Lynx", 2, 36, 2),
-    "0060" to LeaperKimBmsProfile("leaperkim_0060", "Sherman-L", 2, 36, 2),
-    "0070" to LeaperKimBmsProfile("leaperkim_0070", "Patton-S", 2, 30, 2),
-    "0080" to LeaperKimBmsProfile("leaperkim_0080", "Oryx", 2, 42, 4),
+    "0050" to LeaperKimBmsProfile("leaperkim_0050", "Lynx", 2, 36, 4),
+    "0060" to LeaperKimBmsProfile("leaperkim_0060", "Sherman-L", 2, 36, 6),
+    "0070" to LeaperKimBmsProfile("leaperkim_0070", "Patton-S", 2, 30, 4),
+    "0080" to LeaperKimBmsProfile("leaperkim_0080", "Oryx", 2, 42, 6),
     "0090" to LeaperKimBmsProfile("leaperkim_0090", "Lynx-S", 2, 36, 4),
+    // Nosfet, from the same catalogue: Apex 36s4p / 2700 Wh, Aero 30s2p / 1110 Wh,
+    // Aeon 36s2p / 1350 Wh. Apex and Aero were already right; Aeon carried 4.
     "5010" to LeaperKimBmsProfile("nosfet_5010", "Nosfet Apex", 2, 36, 4),
     "5020" to LeaperKimBmsProfile("nosfet_5020", "Nosfet Aero", 2, 30, 2),
-    "5030" to LeaperKimBmsProfile("nosfet_5030", "Nosfet Aeon", 2, 36, 4),
+    "5030" to LeaperKimBmsProfile("nosfet_5030", "Nosfet Aeon", 2, 36, 2),
 )
 
 private val NosfetApexTable = intArrayOf(
@@ -648,14 +858,25 @@ private val NosfetAeroTable = intArrayOf(
 
 private val NosfetOryxTable = NosfetApexTable.map { (it * 42 / 36) }.toIntArray()
 
-private val NosfetShermanTable = intArrayOf(
-    7560, 7596, 7644, 7692, 7740, 7788, 7836, 7884, 7932, 7980,
-    8028, 8076, 8124, 8172, 8220, 8268, 8316, 8364, 8412, 8460,
-    8508, 8556, 8604, 8652, 8700, 8748, 8796, 8844, 8892, 8940,
-    8988, 9036, 9084, 9132, 9180, 9228, 9276, 9324, 9372, 9420,
-    9468, 9516, 9564, 9612, 9660, 9708, 9756, 9804, 9852, 9900,
-    9948, 9996, 10044, 10080
-)
+/**
+ * 24S: the same per-cell curve as [NosfetApexTable], scaled the way [NosfetOryxTable] is.
+ *
+ * The three long tables agree per cell to within 0.00011 V, so the curve is one shape and the
+ * cell count is the only thing that differs - deriving is reading the same evidence, not
+ * inventing a new table.
+ *
+ * What stood here before was 54 hand-written entries from 75.60 V to 100.80 V, spaced a flat
+ * 0.02 V per cell. Percentage is the table *index*, so 54 entries could only ever express
+ * 0..53%: a Sherman at 100.0 V - a cell above 4.16 V, all but full - reported 51%, and the
+ * whole lower half of the pack read at roughly half its true charge. The ramp was linear
+ * besides, which no lithium pack is.
+ *
+ * The cost of the swap is the ceiling documented for the other three tables: this curve tops
+ * out at 4.125 V per cell, 99.00 V here, so the last ~7% of a 24S pack reads a flat 100%.
+ * Fixing that needs a stock-charge-limit discharge capture for all four tables at once, not a
+ * rescale of this one (docs/leaperkim-lynxs-protocol.md).
+ */
+private val NosfetShermanTable = NosfetApexTable.map { (it * 24 / 36) }.toIntArray()
 
 private data class SettingDefinition(
     val key: String,
@@ -754,6 +975,42 @@ private fun ByteArray.withCrc32(): ByteArray {
         value.toByte(),
     )
 }
+
+/**
+ * The hot end of the motor probe's own measuring range, in degrees. The firmware's lookup at
+ * `0x080156F4` walks 27 entries and returns `23000 - 1000 * index` centidegrees, so 220 C is the
+ * most it can report; a larger number on the wire is not a hotter motor, it is a broken frame.
+ */
+private const val MotorProbeCeilingCelsius = 220.0
+
+/** The command family the plugin receiver answers to; stock firmware ignores it. */
+private const val PluginLoaderFamily = 0x61
+private const val PluginLoaderUnlock = 0
+private const val PluginLoaderErase = 1
+private const val PluginLoaderWrite = 2
+
+/** Hand the frame to every plugin. The receiver does not look at what is in it. */
+private const val PluginLoaderCall = 3
+
+/**
+ * The plugin budget cut into flash pages, every one of which the wheel calls.
+ *
+ * A slot is a page because a page is the erase unit: removing a plugin is then exactly one erase
+ * and cannot touch its neighbour. A plugin longer than a page takes the following slots too, and
+ * the wheel skips what it has already accounted for by reading the length out of the header.
+ *
+ * The page above 512 KB on this part is **four** kilobytes, not the two that bank 0 uses. Sizing a
+ * slot at 2 KB cost a wheel its plugins on 2026-08-28: installing the second one erased the page
+ * it shared with the first, and both went away at once. The firmware says 4 KB itself — its own
+ * littlefs volume on internal flash is sixteen blocks of four kilobytes.
+ */
+private const val PluginSlots = 32
+private const val PluginSlotBytes = 4096
+
+/** What the second bank may hold: 128 KB, and 320 KB clear of the wheel's own filesystem. */
+
+/** The `LPLG` word: four bytes, and the last thing an upload writes. */
+private const val MagicHalfwords = 2
 
 private const val CRC32_SIZE = 4
 private const val LegacyFrameSize = 36

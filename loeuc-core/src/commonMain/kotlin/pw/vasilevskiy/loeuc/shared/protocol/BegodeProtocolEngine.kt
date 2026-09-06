@@ -53,6 +53,11 @@ class BegodeProtocolEngine {
     private var modernProtocolSeen = false
     private var maxSeriesCellIndex = -1
     private var modernPackVoltageSeen = false
+    private var decodedModelName: String? = null
+
+    // Series-cell count of the pack: the model's published pack string, handed down by the
+    // caller. There is no fallback guess - see calculateBatteryPercent().
+    private var catalogueSeriesCells = 0
 
     // Per-device no-load ratio (km/h per volt) learned from the live stream, overriding the
     // voltage-class default when the wheel itself proves it wrong. See observeNoLoadEvidence()
@@ -70,6 +75,8 @@ class BegodeProtocolEngine {
         modernProtocolSeen = false
         maxSeriesCellIndex = -1
         modernPackVoltageSeen = false
+        decodedModelName = null
+        catalogueSeriesCells = 0
         learnedNoLoadRatio = null
         noLoadEvidence.clear()
         highPowerAlarmActive = false
@@ -84,6 +91,28 @@ class BegodeProtocolEngine {
         learnedNoLoadRatio = null
         noLoadEvidence.clear()
     }
+
+    /**
+     * How many cells the pack has in series, from the retail catalogue entry for this model.
+     *
+     * Wheels without a smart BMS never report their cells, and the charge scale is the pack
+     * voltage divided by this number - so getting it wrong moves the whole scale. It cannot be
+     * derived from a single voltage reading: a full 36S reads 151.2 V and so does a 40S at
+     * 3.78 V per cell. The caller resolves the model against the catalogue - or takes the rider's
+     * own pick - and pushes the answer down here. Without it the charge stays unknown rather than
+     * being guessed; see [calculateBatteryPercent].
+     *
+     * Ignored for the legacy voltage-class path, where the rider's own choice of pack class is
+     * the better answer. Zero or a nonsensical count clears it.
+     */
+    fun setPackSeriesCells(seriesCells: Int) {
+        catalogueSeriesCells = if (seriesCells in MIN_SERIES_CELLS..MAX_SERIES_CELLS) seriesCells else 0
+    }
+
+    /** Series-cell count the charge scale currently runs on, or `0` while nothing is known. */
+    fun seriesCellCount(): Int = catalogueSeriesCells
+
+    fun modelName(): String? = decodedModelName
 
     /**
      * No-load ratio the PWM estimate currently runs on, in km/h per volt: either the voltage
@@ -112,6 +141,7 @@ class BegodeProtocolEngine {
     }
 
     fun consume(chunk: ByteArray): BegodeTelemetry? {
+        chunk.begodeNameResponse()?.let { decodedModelName = it }
         buffer += chunk
         var updated = false
 
@@ -250,22 +280,28 @@ class BegodeProtocolEngine {
         val speedRaw = frame.int16Be(4)
         val baseVoltage = frame.uint16Be(2) / 100.0
         val voltage = if (baseVoltage in 45.0..70.0) baseVoltage * legacyVoltageScale else frame.uint16Be(16).toDouble()
-        val phaseCurrent = abs(frame.int16Be(10)) / 100.0
+        val phaseCurrentRaw = frame.int16Be(10)
+        val phaseCurrent = abs(phaseCurrentRaw) / 100.0
         val speedKmh = if (abs(speedRaw) <= LEGACY_STATIONARY_SPEED_DEADBAND_RAW) {
             0.0
         } else {
             (abs(speedRaw) * 3.6) / 100.0
         }
 
+        // Deliberately the magnitude: the PWM model adds a resistive-drop term and the no-load
+        // detector compares against a ceiling, and both would read a braking sample as a lightly
+        // loaded one. Reading PWM high under braking is the safe direction to be wrong in.
         observeNoLoadEvidence(speedKmh, voltage, phaseCurrent)
         val pwm = calculateLegacyPwmPercent(speedKmh, voltage, phaseCurrent)
+        val flow = powerFlowSign(phaseCurrentRaw, speedRaw, TorqueSignConvention.AgreementIsDriving)
         return state.copy(
             speedKmh = speedKmh,
             pwmPercent = pwm,
             voltage = voltage,
-            current = phaseCurrent * (pwm / 100.0), // Estimated battery current
+            current = flow * phaseCurrent * (pwm / 100.0), // Estimated battery current
             phaseCurrent = phaseCurrent,
-            power = voltage * phaseCurrent * (pwm / 100.0),
+            power = flow * voltage * phaseCurrent * (pwm / 100.0),
+            // Apparent power is a magnitude by definition, so it keeps no sign.
             apparentPower = voltage * phaseCurrent * (pwm / 100.0),
             temperature = frame.int16Be(12) / 340.0 + 36.53,
             batteryPercent = calculateBatteryPercent(voltage, emptyList(), isLegacy = true),
@@ -442,31 +478,47 @@ class BegodeProtocolEngine {
         return lowerPercent + (upperPercent - lowerPercent) * (cellVoltage - lowerVoltage) / span
     }
 
+    /**
+     * Charge from the pack voltage, which is only meaningful once the series-cell count is known.
+     *
+     * There is no guess here on purpose. The count used to be inferred from the live pack voltage
+     * by buckets, and that is a trap rather than an approximation: the buckets stepped at 90 V,
+     * which sits in the middle of a 24S pack's working range, so every sag under that line moved
+     * the divider from 24 to 20 and the reported charge jumped from about 53 % to a clipped 100 %.
+     * A rider who connected below the line - a T4 at half charge - saw a full battery for the
+     * whole session. Two layers of latching were built on top to hold the guess steady, and
+     * neither survived a reconnect.
+     *
+     * The count cannot be derived from one voltage reading even in principle: a full 36S reads
+     * 151.2 V and so does a 40S at 3.78 V per cell. It comes from the pack itself (a smart BMS
+     * reporting cells), or from the catalogue entry for the model, and when neither is available
+     * the honest answer is that the charge is unknown.
+     */
     private fun calculateBatteryPercent(voltage: Double, cells: List<Double>, isLegacy: Boolean): Double {
         val cellVoltage = if (cells.isNotEmpty()) cells.average() else {
-            // Legacy wheels have a fixed, user-selected voltage class (legacyMaxVoltage), so the
-            // series-cell count must stay pinned to that class rather than be re-derived from the
-            // live pack voltage - otherwise it flips buckets as voltage sags during a ride and the
-            // reported charge jumps back up instead of decreasing.
+            // Legacy wheels have a fixed, rider-selected voltage class (legacyMaxVoltage), so the
+            // series-cell count stays pinned to that class rather than being re-derived from the
+            // live pack voltage.
             val series = if (isLegacy && legacyMaxVoltage > 0.0) {
-                (legacyMaxVoltage / 4.2).roundToInt().toDouble()
+                (legacyMaxVoltage / 4.2).roundToInt()
             } else {
-                when {
-                    voltage >= 180.0 -> 50.0
-                    voltage >= 145.0 -> 40.0
-                    voltage >= 110.0 -> 32.0
-                    voltage >= 90.0 -> 24.0
-                    else -> 20.0
-                }
+                catalogueSeriesCells
             }
+            if (series <= 0) return Double.NaN
             voltage / series
         }
 
         return batteryPercentFromCellVoltage(cellVoltage)
     }
 
+    /**
+     * Series-cell count used to rebuild the pack voltage from cell readings. Measured cells win
+     * over the catalogue - they are the pack itself rather than its data sheet - and the
+     * catalogue wins over the blanket default, which is a 32S guess that suits no 24S wheel.
+     */
     private fun inferredSeriesCellCount(): Int {
-        return maxOf(DEFAULT_SERIES_CELL_COUNT, maxSeriesCellIndex + 1)
+        val nominal = if (catalogueSeriesCells > 0) catalogueSeriesCells else DEFAULT_SERIES_CELL_COUNT
+        return maxOf(nominal, maxSeriesCellIndex + 1)
     }
 
     private fun ByteArray.indexOfHeader(): Int {
@@ -474,6 +526,15 @@ class BegodeProtocolEngine {
             if (this[i] == 0x55.toByte() && this[i + 1] == 0xAA.toByte()) return i
         }
         return -1
+    }
+
+    private fun ByteArray.begodeNameResponse(): String? {
+        val prefix = "NAME:".encodeToByteArray()
+        if (size < prefix.size || !prefix.indices.all { this[it] == prefix[it] }) return null
+        return copyOfRange(prefix.size, size)
+            .decodeToString()
+            .trim { it == '\u0000' || it == '\r' || it == '\n' || it == ' ' }
+            .takeIf { it.isNotEmpty() }
     }
 
     private fun ByteArray.hasFooter(): Boolean {
@@ -554,6 +615,11 @@ class BegodeProtocolEngine {
         private const val LEGACY_BASE_MAX_VOLTAGE = 67.2
         private const val LEGACY_STATIONARY_SPEED_DEADBAND_RAW = 100
         private const val DEFAULT_SERIES_CELL_COUNT = 32
+
+        // Sanity bounds on a pushed-down series-cell count: below is no unicycle pack, above is
+        // not one either, and either way it is a caller's mistake rather than a pack.
+        private const val MIN_SERIES_CELLS = 10
+        private const val MAX_SERIES_CELLS = 60
         private const val LEGACY_ESTIMATED_PHASE_RESISTANCE = 0.05
 
         /** WheelLog's default for the same model; the free-spin ratio alone reads optimistically. */

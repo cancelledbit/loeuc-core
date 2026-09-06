@@ -203,6 +203,20 @@ class InmotionProtocolEngine {
 
     fun settingsCapabilities(): List<InmotionSettingCapability> = settings
 
+    /** Canonical model hint for platform battery-catalogue lookup; null until main info arrives. */
+    fun modelName(): String? = when (modelId) {
+        MODEL_V11 -> "V11"
+        62 -> "V11Y"
+        71, 72 -> "V12"
+        73 -> "V12 Pro"
+        81, 82 -> "V13 Challenger"
+        91, 92 -> "V14 Adventure"
+        111 -> "V12S"
+        121 -> "V9"
+        MODEL_P6 -> "P6"
+        else -> null
+    }
+
     /**
      * Builds a write command for a V12 setting exposed by [settingsCapabilities].
      * The auto-light-threshold and beam-brightness fields are packed low/high pairs

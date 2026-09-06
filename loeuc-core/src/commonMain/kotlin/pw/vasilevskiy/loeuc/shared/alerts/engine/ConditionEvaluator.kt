@@ -13,11 +13,31 @@ open class ConditionEvaluator {
 
     /**
      * The outcome of evaluating one condition.
+     *
+     * @param rearmed the condition crossed another
+     *   [pw.vasilevskiy.loeuc.shared.alerts.model.ConditionTemplate.repeatEveryValue] step on
+     *   this frame. This is an edge, not a level: it is true for exactly the one frame that
+     *   crosses, which is what lets an alert fire again without ever leaving its hysteresis
+     *   band.
      */
     data class EvaluationResult(
         val isSatisfied: Boolean,
         val updatedHistory: ConditionStateHistory,
-        val metricValue: Double?
+        val metricValue: Double?,
+        val rearmed: Boolean = false
+    )
+
+    /**
+     * The outcome of evaluating a group or a whole alert's conditions.
+     *
+     * A plain `Pair` carried this before the step existed. It is a named type now because the
+     * third value is easy to drop silently at a call site, and dropping it means an alert that
+     * quietly never repeats.
+     */
+    data class ConditionOutcome(
+        val isMet: Boolean,
+        val rearmed: Boolean,
+        val states: Map<String, ConditionStateHistory>
     )
 
     /**
@@ -51,9 +71,20 @@ open class ConditionEvaluator {
             0L
         }
 
+        // The step walks only while the condition holds. Clearing the index as soon as it
+        // stops holding keeps the two rearm paths apart: leaving the hysteresis band is the
+        // ordinary rearm, crossing a step is the other, and neither should be able to claim a
+        // firing that belongs to the other.
+        val advance = if (currentlyRawMet) {
+            template.advanceStep(value, history.lastFiredStepIndex)
+        } else {
+            null
+        }
+
         val updatedHistory = history.copy(
             isConditionMet = currentlyRawMet,
-            firstMetTimestampMs = updatedFirstMet
+            firstMetTimestampMs = updatedFirstMet,
+            lastFiredStepIndex = if (currentlyRawMet) advance?.index else null
         )
 
         val timeInCondition = if (currentlyRawMet && updatedFirstMet > 0L) {
@@ -67,7 +98,10 @@ open class ConditionEvaluator {
         return EvaluationResult(
             isSatisfied = isDurationSatisfied,
             updatedHistory = updatedHistory,
-            metricValue = value
+            metricValue = value,
+            // A step crossed while the hold time has not elapsed is not a firing: minDurationMs
+            // gates every way an alert can sound.
+            rearmed = isDurationSatisfied && advance?.rearmed == true
         )
     }
 
@@ -81,9 +115,10 @@ open class ConditionEvaluator {
         snapshot: TelemetrySnapshot,
         stateMap: Map<String, ConditionStateHistory>,
         keyPrefix: String = ""
-    ): Pair<Boolean, Map<String, ConditionStateHistory>> {
+    ): ConditionOutcome {
         val updatedMap = stateMap.toMutableMap()
         var allMet = true
+        var rearmed = false
 
         for (condition in group.conditions) {
             val key = stateKey(keyPrefix, condition.id)
@@ -93,9 +128,14 @@ open class ConditionEvaluator {
             if (!res.isSatisfied) {
                 allMet = false
             }
+            if (res.rearmed) {
+                rearmed = true
+            }
         }
 
-        return Pair(allMet, updatedMap)
+        // A group is AND, so a step crossed inside it only counts while the whole group holds:
+        // "trip every 5 km AND speed above 30" must not speak while the rider is stopped.
+        return ConditionOutcome(allMet, allMet && rearmed, updatedMap)
     }
 
     /**
@@ -108,9 +148,10 @@ open class ConditionEvaluator {
         snapshot: TelemetrySnapshot,
         stateMap: Map<String, ConditionStateHistory>,
         keyPrefix: String = ""
-    ): Pair<Boolean, Map<String, ConditionStateHistory>> {
+    ): ConditionOutcome {
         val updatedMap = stateMap.toMutableMap()
         var anyMet = false
+        var rearmed = false
 
         for (item in items) {
             when (item) {
@@ -122,18 +163,24 @@ open class ConditionEvaluator {
                     if (res.isSatisfied) {
                         anyMet = true
                     }
+                    if (res.rearmed) {
+                        rearmed = true
+                    }
                 }
                 is ConditionGroup -> {
-                    val (groupMet, groupState) = evaluateGroup(item, snapshot, updatedMap, keyPrefix)
-                    updatedMap.putAll(groupState)
-                    if (groupMet) {
+                    val group = evaluateGroup(item, snapshot, updatedMap, keyPrefix)
+                    updatedMap.putAll(group.states)
+                    if (group.isMet) {
                         anyMet = true
+                    }
+                    if (group.rearmed) {
+                        rearmed = true
                     }
                 }
             }
         }
 
-        return Pair(anyMet, updatedMap)
+        return ConditionOutcome(anyMet, rearmed, updatedMap)
     }
 
     companion object {

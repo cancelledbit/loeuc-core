@@ -6,6 +6,18 @@ import kotlin.test.assertTrue
 
 class KingSongProtocolEngineTest {
     @Test
+    fun exposesTheNameResponseForPlatformCatalogueLookup() {
+        val engine = KingSongProtocolEngine()
+        val frame = kingSongFrame(command = 0xBB).apply {
+            "KS-S22-2104".encodeToByteArray().copyInto(this, destinationOffset = 2)
+        }
+
+        engine.consume(frame)
+
+        assertEquals("KS-S22-2104", engine.modelName())
+    }
+
+    @Test
     fun commandsMatchOfficialAppShape() {
         val engine = KingSongProtocolEngine()
         val read = engine.initialReadCommand()

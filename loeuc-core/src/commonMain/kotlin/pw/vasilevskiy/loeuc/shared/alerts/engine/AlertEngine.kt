@@ -12,6 +12,7 @@ import pw.vasilevskiy.loeuc.shared.alerts.model.ConditionGroup
 import pw.vasilevskiy.loeuc.shared.alerts.model.ConditionTemplate
 import pw.vasilevskiy.loeuc.shared.alerts.model.MetricId
 import pw.vasilevskiy.loeuc.shared.alerts.model.SingleCondition
+import pw.vasilevskiy.loeuc.shared.alerts.model.SpokenAnnouncement
 import pw.vasilevskiy.loeuc.shared.alerts.model.TelemetrySnapshot
 
 import kotlin.jvm.JvmOverloads
@@ -53,6 +54,17 @@ class AlertEngine @JvmOverloads constructor(
     private val alertSource: AlertSource? = null,
 ) {
 
+    /**
+     * Called with each announcement the moment it is released to be spoken.
+     *
+     * A property rather than a constructor parameter on purpose: Kotlin default arguments do
+     * not survive Swift interop, so every new constructor parameter breaks both iOS call
+     * sites.
+     */
+    var announcementPublisher: (SpokenAnnouncement) -> Unit = {}
+
+    private val announcementArbiter = AnnouncementArbiter()
+
     private val alerts = mutableListOf<Alert>()
 
     // Condition tracking state, keyed "alertId:conditionId" -> ConditionStateHistory. The key
@@ -70,6 +82,21 @@ class AlertEngine @JvmOverloads constructor(
     // edge detection that applies and reverts commands (Alert.commands), separately from
     // oneShotFiredMap/alertLastTriggeredMap, which drive sound.
     private val alertConditionActiveMap = mutableMapOf<String, Boolean>()
+
+    // Spoken alerts that were rejected for having more than one top-level condition, so the
+    // reason is printed once each instead of on every frame for the rest of the ride.
+    private val warnedAmbiguousSpoken = mutableSetOf<String>()
+
+    /**
+     * Reported by the platform's speech output while a phrase is being spoken.
+     *
+     * The engine cannot work this out for itself: it runs on telemetry time, and speech takes
+     * wall-clock time. Without it, a replay at ten times speed would release announcements far
+     * faster than any synthesizer could say them.
+     */
+    fun setSpeaking(value: Boolean) {
+        announcementArbiter.setSpeaking(value)
+    }
 
     fun setAlerts(newAlerts: List<Alert>) {
         alerts.clear()
@@ -95,7 +122,9 @@ class AlertEngine @JvmOverloads constructor(
         alertLastTriggeredMap.clear()
         oneShotFiredMap.clear()
         alertConditionActiveMap.clear()
+        warnedAmbiguousSpoken.clear()
         arbiter.clear()
+        announcementArbiter.clear()
     }
 
     /**
@@ -118,6 +147,7 @@ class AlertEngine @JvmOverloads constructor(
         setAlerts(activeAlerts)
         val candidates = mutableListOf<AlertTriggerEvent>()
         val voiceCandidates = mutableListOf<VoiceCandidate>()
+        val spokenCandidates = mutableListOf<AnnouncementCandidate>()
         val nowMs = snapshot.timestampMs
 
         for (alert in alerts) {
@@ -137,7 +167,7 @@ class AlertEngine @JvmOverloads constructor(
             // printed - a device console shows it without a debugger attached, which for a
             // crash in a beta build is the only way to learn what failed.
             try {
-                processAlert(alert, snapshot, nowMs, candidates, voiceCandidates)
+                processAlert(alert, snapshot, nowMs, candidates, voiceCandidates, spokenCandidates)
             } catch (t: Throwable) {
                 println("AlertEngine: skipped alert ${alert.id}: ${t.stackTraceToString()}")
             }
@@ -147,16 +177,42 @@ class AlertEngine @JvmOverloads constructor(
         val activeVoice = arbiter.select(voiceCandidates, nowMs)
         voicePublisher(activeVoice)
 
-        if (activeVoice == null) return emptyList()
+        val events = mutableListOf<AlertTriggerEvent>()
+
+        // Speech is settled after the tone, because whether a tone is sounding is exactly what
+        // decides if a phrase may be spoken now or has to keep waiting.
+        val announcement = announcementArbiter.select(
+            candidates = spokenCandidates,
+            toneSounding = activeVoice != null,
+            nowMs = nowMs,
+        )
+        if (announcement != null) {
+            alertLastTriggeredMap[announcement.alertId] = nowMs
+            oneShotFiredMap[announcement.alertId] = true
+            announcementPublisher(announcement)
+            alerts.firstOrNull { it.id == announcement.alertId }?.let { spokenAlert ->
+                events.add(
+                    AlertTriggerEvent(
+                        alert = spokenAlert,
+                        timestampMs = nowMs,
+                        currentIntervalMs = 0L,
+                        triggeredMetrics = extractTriggeredMetrics(spokenAlert, snapshot)
+                    )
+                )
+            }
+        }
+
+        if (activeVoice == null) return events
 
         // Only the alert that currently owns the voice gets an event, and only once its
         // cadence is due. Wheel commands are not tied to this: they follow the condition's
         // edges further up, whoever won the voice.
-        val winner = candidates.firstOrNull { it.alert.id == activeVoice.alertId } ?: return emptyList()
+        val winner = candidates.firstOrNull { it.alert.id == activeVoice.alertId } ?: return events
 
         alertLastTriggeredMap[winner.alert.id] = nowMs
         oneShotFiredMap[winner.alert.id] = true
-        return listOf(winner)
+        events.add(winner)
+        return events
     }
 
     /**
@@ -171,15 +227,24 @@ class AlertEngine @JvmOverloads constructor(
         nowMs: Long,
         candidates: MutableList<AlertTriggerEvent>,
         voiceCandidates: MutableList<VoiceCandidate>,
+        spokenCandidates: MutableList<AnnouncementCandidate>,
     ) {
-            val (isMet, updatedStates) = evaluator.evaluateAlertConditions(
+            val outcome = evaluator.evaluateAlertConditions(
                 items = alert.conditionItems,
                 snapshot = snapshot,
                 stateMap = conditionStateMap,
                 keyPrefix = alert.id
             )
+            val isMet = outcome.isMet
 
-            conditionStateMap.putAll(updatedStates)
+            conditionStateMap.putAll(outcome.states)
+
+            // A step crossed rearms the alert without it ever leaving the hysteresis band.
+            // That is the only way "trip every 5 km" can sound more than once: trip distance
+            // never falls back, so the ordinary rearm below never comes.
+            if (outcome.rearmed) {
+                oneShotFiredMap[alert.id] = false
+            }
 
             // Command edges: these fire on the condition's transitions alone, independent of
             // AlertType (the sound cadence) and of the arbiter (the contest for the single
@@ -215,30 +280,36 @@ class AlertEngine @JvmOverloads constructor(
             //
             // Progress belongs here anyway: OneShot and Repeating have no notion of it, and a
             // separate pass over the type to compute it was redundant from the start.
-            val (shouldTrigger, calculatedInterval, voice) = when (val type = alert.type) {
+            val decision = when (val type = alert.type) {
                 is AlertType.OneShot -> {
                     val alreadyFired = oneShotFiredMap[alert.id] ?: false
                     val timeoutExpired = type.autoResetTimeoutMs > 0L && (timeSinceLast >= type.autoResetTimeoutMs)
-                    Triple(
-                        !alreadyFired || timeoutExpired,
-                        0L,
-                        AlertVoice(alert.id, alert.soundPattern, 0.0, 0L),
+                    val trigger = !alreadyFired || timeoutExpired
+                    AlertDecision(
+                        shouldTrigger = trigger,
+                        intervalMs = 0L,
+                        voice = AlertVoice(alert.id, alert.soundPattern, 0.0, 0L),
+                        // A one-shot holds the slot for exactly one pass of its pattern and
+                        // then lets go, or a single beep would turn into an endless drone and
+                        // mute every less critical neighbour forever.
+                        ownsVoice = trigger || timeSinceLast < alert.soundPattern.totalDurationMs(),
                     )
                 }
-                is AlertType.Repeating -> Triple(
-                    lastTriggered == 0L || timeSinceLast >= type.intervalMs,
-                    type.intervalMs,
-                    AlertVoice(alert.id, alert.soundPattern, 0.0, type.intervalMs),
+                is AlertType.Repeating -> AlertDecision(
+                    shouldTrigger = lastTriggered == 0L || timeSinceLast >= type.intervalMs,
+                    intervalMs = type.intervalMs,
+                    voice = AlertVoice(alert.id, alert.soundPattern, 0.0, type.intervalMs),
+                    ownsVoice = true,
                 )
                 is AlertType.Accelerating -> {
                     val value = extractPrimaryMetricValue(alert, snapshot) ?: 0.0
                     val (minTarget, maxTarget) = extractThresholds(alert)
                     val progress = AccelerationCalculator.progressFor(value, minTarget, maxTarget)
                     val cadence = AlertCadence.forProgress(type, progress)
-                    Triple(
-                        lastTriggered == 0L || timeSinceLast >= cadence.intervalMs,
-                        cadence.intervalMs,
-                        AlertVoice(
+                    AlertDecision(
+                        shouldTrigger = lastTriggered == 0L || timeSinceLast >= cadence.intervalMs,
+                        intervalMs = cadence.intervalMs,
+                        voice = AlertVoice(
                             alertId = alert.id,
                             pattern = alert.soundPattern,
                             progress = progress,
@@ -246,6 +317,19 @@ class AlertEngine @JvmOverloads constructor(
                             pitchRatio = cadence.pitchRatio,
                             continuous = cadence.continuous,
                         ),
+                        ownsVoice = true,
+                    )
+                }
+                is AlertType.Spoken -> {
+                    // A spoken alert never enters the contest for the tone slot. Its whole
+                    // waiting rule lives in AnnouncementArbiter instead.
+                    val alreadySpoken = oneShotFiredMap[alert.id] ?: false
+                    AlertDecision(
+                        shouldTrigger = !alreadySpoken && isSpeakable(alert),
+                        intervalMs = 0L,
+                        voice = null,
+                        ownsVoice = false,
+                        spokenPhrase = type.phrase,
                     )
                 }
                 // A branch the types say cannot be reached: `AlertType` is sealed with three
@@ -261,37 +345,96 @@ class AlertEngine @JvmOverloads constructor(
                 // exists and nobody handled it here.
                 else -> {
                     println("AlertEngine: unhandled alert type ${alert.type} - add a branch in processAlert")
-                    Triple(
-                        lastTriggered == 0L || timeSinceLast >= 1_000L,
-                        1_000L,
-                        AlertVoice(alert.id, alert.soundPattern, 0.0, 1_000L),
+                    AlertDecision(
+                        shouldTrigger = lastTriggered == 0L || timeSinceLast >= 1_000L,
+                        intervalMs = 1_000L,
+                        voice = AlertVoice(alert.id, alert.soundPattern, 0.0, 1_000L),
+                        ownsVoice = true,
                     )
                 }
             }
 
-            // Repeating and Accelerating claim the slot on every frame their condition holds,
-            // because they are meant to sound for all of it. OneShot does not: it holds the
-            // slot for exactly one pass of its pattern and lets go, or a single beep would
-            // turn into an endless drone and mute every less critical neighbour forever. It
-            // lets go by itself - the alert simply stops being a candidate and the arbiter
-            // hands the slot to the next one.
-            val ownsVoice = alert.type !is AlertType.OneShot ||
-                shouldTrigger ||
-                timeSinceLast < alert.soundPattern.totalDurationMs()
-            if (ownsVoice) {
+            // Whether an alert claims the single tone slot is decided inside the dispatch
+            // above, deliberately. It used to be worked out here, from the type, and that was
+            // a second `when` on the same value in the same function - the construct whose
+            // failure on Kotlin/Native this file already carries a warning about. The rule
+            // itself was also stated from the wrong end ("everything except OneShot"), which
+            // would have handed the slot to a spoken alert and made it beep.
+            val voice = decision.voice
+            if (decision.ownsVoice && voice != null) {
                 voiceCandidates.add(VoiceCandidate(voice, alert.priority))
             }
 
-            if (shouldTrigger) {
-                candidates.add(
-                    AlertTriggerEvent(
-                        alert = alert,
-                        timestampMs = nowMs,
-                        currentIntervalMs = calculatedInterval,
-                        triggeredMetrics = extractTriggeredMetrics(alert, snapshot)
+            if (decision.shouldTrigger) {
+                val phrase = decision.spokenPhrase
+                val spokenMetric = if (phrase != null) findFirstSingleCondition(alert.conditionItems)?.metric else null
+                if (phrase != null && spokenMetric != null) {
+                    spokenCandidates.add(
+                        AnnouncementCandidate(
+                            announcement = SpokenAnnouncement(
+                                alertId = alert.id,
+                                phrase = phrase,
+                                metric = spokenMetric,
+                                // Read on this frame, and read again on every frame the
+                                // announcement keeps waiting: the number that is spoken is the
+                                // number at the moment of speaking.
+                                value = snapshot.getValue(spokenMetric) ?: 0.0,
+                            ),
+                            priority = alert.priority,
+                        )
                     )
-                )
+                } else {
+                    candidates.add(
+                        AlertTriggerEvent(
+                            alert = alert,
+                            timestampMs = nowMs,
+                            currentIntervalMs = decision.intervalMs,
+                            triggeredMetrics = extractTriggeredMetrics(alert, snapshot)
+                        )
+                    )
+                }
             }
+    }
+
+    /**
+     * One alert's verdict for one frame.
+     *
+     * A named type rather than a tuple because every field here is decided inside the single
+     * dispatch on [AlertType] and must not be re-derived from the type afterwards.
+     *
+     * @param voice null for an alert that makes no tone at all.
+     * @param spokenPhrase non-null only for [AlertType.Spoken]; carrying it out of the dispatch
+     *   is what saves the caller from asking the type a second time.
+     */
+    private data class AlertDecision(
+        val shouldTrigger: Boolean,
+        val intervalMs: Long,
+        val voice: AlertVoice?,
+        val ownsVoice: Boolean,
+        val spokenPhrase: String? = null,
+    )
+
+    /**
+     * Whether a spoken alert can name what fired it.
+     *
+     * Top-level condition items are combined with OR, so with two of them there is no telling
+     * which branch was true and the phrase would state something the rider is not doing. One
+     * item is enough even when it is an AND group: when a group holds, all of its conditions
+     * hold at once.
+     *
+     * The editor does not let such an alert be created. This is the second line, for a file
+     * edited by hand or written by an older version, and it prints once per alert rather than
+     * on every frame - fifty lines a second would bury the reason it exists to give.
+     */
+    private fun isSpeakable(alert: Alert): Boolean {
+        if (alert.conditionItems.size == 1) return true
+        if (warnedAmbiguousSpoken.add(alert.id)) {
+            println(
+                "AlertEngine: spoken alert ${alert.id} has ${alert.conditionItems.size} top-level " +
+                    "conditions combined with OR, so it cannot say which one fired - staying silent"
+            )
+        }
+        return false
     }
 
     private fun dispatchCommands(alert: Alert, trigger: AlertCommandTrigger) {

@@ -37,6 +37,17 @@ object MetricIdSources {
         ),
         MetricId.TEMPERATURE_MOS_C to listOf(DeviceMetric.MosTemperatureC),
         MetricId.TEMPERATURE_MOTOR_C to listOf(DeviceMetric.MotorTemperatureC),
+        // One rule: this is the hottest battery reading the device reports, because an alert on
+        // battery temperature is an overheat warning and the coldest pack cannot raise one.
+        // [DeviceMetric.BatteryTemperatureMinC] is the fallback rather than a second metric:
+        // a wheel with a single battery probe fills only the min slot (InMotion V11/V12 map
+        // their one `batteryTemperature` there), and without the fallback that reading would be
+        // dropped and the alert would look broken on exactly the wheels that do have a sensor.
+        // On a wheel that reports both, the max always wins, so the fallback never masks it.
+        MetricId.TEMPERATURE_BATTERY_C to listOf(
+            DeviceMetric.BatteryTemperatureMaxC,
+            DeviceMetric.BatteryTemperatureMinC,
+        ),
         MetricId.PITCH_DEG to listOf(DeviceMetric.PitchDeg),
         MetricId.ROLL_DEG to listOf(DeviceMetric.RollDeg),
         MetricId.TRIP_DISTANCE_KM to listOf(DeviceMetric.TripDistanceKm),

@@ -121,6 +121,29 @@ class LeaperKimProtocolEngineTest {
     }
 
     @Test
+    fun angleTrimRoundsHundredthsToTheNearestTenth() {
+        // The wheel reports hundredths, the capability carries tenths. Truncation toward zero
+        // showed -7.99 deg as -7.9 and 2.57 deg as 2.5 - always a tenth closer to level.
+        listOf(-799 to -80, 257 to 26, -26 to -3, 4 to 0, 804 to 80).forEach { (hundredths, tenths) ->
+            val engine = LeaperKimProtocolEngine()
+            engine.consume(
+                frame(page = 8).apply {
+                    (47 until size).forEach { this[it] = 0x80.toByte() }
+                }.withUpdatedCrc(),
+            )
+            engine.consume(
+                frame(page = 0).apply {
+                    putInt16Be(67, hundredths)
+                }.withUpdatedCrc(),
+            )
+
+            val trim = engine.allSettingsCapabilities().single { it.key == "angle_trim" }
+            assertTrue(trim.isSupported)
+            assertEquals(tenths, trim.rawValue, "trim $hundredths/100 deg")
+        }
+    }
+
+    @Test
     fun resetClearsBothRollAndPedalTrim() {
         val engine = LeaperKimProtocolEngine()
         val page8 = frame(page = 8).apply {
@@ -246,6 +269,26 @@ class LeaperKimProtocolEngineTest {
         assertEquals(34.56, telemetry.temperature, 0.01)
         assertEquals(40.88, telemetry.mosTemperature, 0.01)
         assertTrue(telemetry.motorTemperature.isNaN())
+    }
+
+    /**
+     * A firmware patched to put the measured motor probe (`0x20005F18`) and the modelled coil
+     * (`0x20005F1C`) on the wire replaces the `0x80` sentinels at `@40..43` with big-endian
+     * centidegrees. Confirmed on real hardware: a patched Lynx-S reported `09 4C 0B B8` =
+     * 23.80 C motor / 30.00 C coil there where stock ships `80 80 80 80`.
+     */
+    @Test
+    fun decodesMotorAndCoilTemperatureFromPatchedFrame() {
+        val engine = LeaperKimProtocolEngine()
+        val page0 = frame(page = 0).apply {
+            putInt16Be(40, 2_380)
+            putInt16Be(42, 3_000)
+        }.withUpdatedCrc()
+
+        val telemetry = assertNotNull(engine.consume(page0))
+
+        assertEquals(23.80, telemetry.motorTemperature, 0.01)
+        assertEquals(30.00, telemetry.coilTemperature, 0.01)
     }
 
     @Test
@@ -387,6 +430,33 @@ class LeaperKimProtocolEngineTest {
     }
 
     /**
+     * Sherman-s (hardware `0030`) is a 24S wheel and must not be guessed into the 30S curve.
+     *
+     * Fixture: a verbatim page-2 frame from loeuc_882583F51F81_unknown_20260819_220233.jsonl
+     * (device LK8435, firmware 3015), captured on a pack its rider reports as fully charged. The
+     * frame is 54 bytes, so offset 50 lands in the CRC32 trailer and the wheel publishes no
+     * percentage of its own - the voltage curve is the only answer available, and which curve it
+     * picks is the whole question.
+     *
+     * `0030` was absent from the model table, so the sCount fell through to
+     * guessSCountFromVoltage, whose "above 100.0 V means 30S" branch is exactly wrong at the top
+     * of a 24S pack: 100.86 V is 4.2025 V per cell across 24 cells and an impossible 3.362 V
+     * across 30. The rider saw 15% on a full wheel.
+     */
+    @Test
+    fun shermanSUsesThe24sBatteryCurveRatherThanTheVoltageGuess() {
+        val engine = LeaperKimProtocolEngine()
+        val page2 =
+            "DC5A5C32276700000B8A0000A6210228FFFA100909100000038407D00BC70003FFEE007A006F000000000000000002370101AA0482CE"
+
+        val telemetry = assertNotNull(engine.consume(page2.decodeHex()))
+
+        assertEquals("0030", telemetry.hardwareCode)
+        assertEquals(100.87, telemetry.voltage, 0.01)
+        assertEquals(100.0, telemetry.batteryPercent, 0.001)
+    }
+
+    /**
      * The legacy 36-byte Sherman Max frame has no byte 46, so `page` reads null on every frame
      * and the voltage-curve estimate is the only source of a battery percentage there. It used to
      * be computed from the first frame the engine saw and then frozen: the guard said "estimate
@@ -395,7 +465,11 @@ class LeaperKimProtocolEngineTest {
      * Fixtures: two verbatim frames from loeuc_882583F4626E_unknown_20260806_143311.jsonl
      * (device LK5690), the same capture as the other legacy fixtures here, at the highest and
      * lowest pack voltage it contains. Hardware code reads 0011, so this is the 24S Sherman
-     * curve; 0.01 V is 0.0208% on it.
+     * curve.
+     *
+     * The expected numbers moved when [NosfetShermanTable] stopped being 54 linear entries and
+     * became the validated per-cell curve at 24 cells: 92.64 V is 3.86 V per cell, which is 71%
+     * of a lithium pack, not the 35.75% a table that could only count to 53 could report.
      */
     @Test
     fun legacyBatteryPercentTracksVoltageInsteadOfFreezingOnTheFirstFrame() {
@@ -405,11 +479,11 @@ class LeaperKimProtocolEngineTest {
 
         val first = assertNotNull(engine.consume(higher.decodeHex()))
         assertEquals(92.64, first.voltage, 0.01)
-        assertEquals(35.75, first.batteryPercent, 0.001)
+        assertEquals(71.0, first.batteryPercent, 0.001)
 
         val second = assertNotNull(engine.consume(lower.decodeHex()))
         assertEquals(92.60, second.voltage, 0.01)
-        assertEquals(35.6667, second.batteryPercent, 0.001)
+        assertEquals(70.8333, second.batteryPercent, 0.001)
     }
 
     /**
@@ -582,6 +656,42 @@ class LeaperKimProtocolEngineTest {
         assertTrue(telemetry.batteryTempMode.isNaN())
         assertTrue(telemetry.lockState.isNaN())
         assertEquals("0011", telemetry.hardwareCode)
+        assertEquals("Sherman Max", engine.modelName())
+    }
+
+    /**
+     * Sherman Max carries no binary `0x0D` handler, so the light has to go out as text. The
+     * firmware image is the proof; see [LeaperKimProtocolEngine.usesTextLightCommand].
+     */
+    @Test
+    fun shermanMaxTakesOnlyTheTextLightCommand() {
+        val engine = LeaperKimProtocolEngine()
+        val legacy = "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1"
+
+        val telemetry = assertNotNull(engine.consume(legacy.decodeHex()))
+
+        assertEquals("0011", telemetry.hardwareCode)
+        assertTrue(engine.usesTextLightCommand())
+    }
+
+    /** A wheel with the binary handler keeps the binary frame, and so does an unidentified one. */
+    @Test
+    fun newerModelsAndUnknownWheelsKeepTheBinaryLightCommand() {
+        val fresh = LeaperKimProtocolEngine()
+        assertFalse(fresh.usesTextLightCommand())
+
+        val lynxS = LeaperKimProtocolEngine()
+        lynxS.consume(LYNX_S_PAGE_0.decodeHex())
+        assertFalse(lynxS.usesTextLightCommand())
+    }
+
+    @Test
+    fun protocolHardwareCodeNamesNewerModelsWithoutEnablingBmsParsing() {
+        val engine = LeaperKimProtocolEngine()
+
+        engine.consume(LYNX_S_PAGE_0.decodeHex())
+
+        assertEquals("Lynx-S", engine.modelName())
     }
 
     /**
@@ -645,6 +755,74 @@ class LeaperKimProtocolEngineTest {
         assertEquals(15.0, calculateLeaperKimFieldWeakening(130.0, false, "0070", 7003)!!, 0.0001)
         assertEquals(35.0, calculateLeaperKimFieldWeakening(130.0, true, "0070", 7003)!!, 0.0001)
     }
+
+    // `@16` is the q-axis (torque) current, and its sign is load-bearing. Which way round it
+    // runs is a property of this firmware's axis convention, not of physics: on Begode agreement
+    // with the speed word means driving, on LeaperKim it means braking. That was established the
+    // expensive way - the Begode rule was carried over on the strength of both fields being
+    // q-axis currents, and on the first real ride every sign came out backwards.
+    //
+    // The evidence is ride `LK21571` of 2026-08-20, 4.33 km, 1688 moving samples. Binned by
+    // acceleration, mean power ran -1801 W under hard acceleration against +130 W under hard
+    // braking, correlating -0.620 with acceleration. Integrated the way this test asserts, the
+    // ride consumed +108.5 Wh, which agrees with the pack falling from 129.8 V to 127.1 V; the
+    // other way round it produced 108.5 Wh out of nowhere.
+    //
+    // None of the captures in the tree has a LeaperKim moving, so speed and current are set here
+    // rather than lifted from a frame; the offsets themselves are pinned by the tests above.
+
+    @Test
+    fun torqueCurrentOpposingTravelDirectionDrawsFromThePack() {
+        val engine = LeaperKimProtocolEngine()
+        val driving = frame(page = 0).apply {
+            putInt16Be(6, 250)      // +25.0 km/h
+            putInt16Be(16, -480)    // -48.0 A, opposite sign: on this firmware that is drive
+            putUInt16Be(34, 4_200)  // 42 % output
+            putUInt16Be(4, 14_500)
+        }.withUpdatedCrc()
+
+        val telemetry = assertNotNull(engine.consume(driving))
+
+        assertEquals(25.0, telemetry.speedKmh, 0.01)
+        assertEquals(48.0, telemetry.phaseCurrent, 0.01, "phase current is effort, not direction")
+        assertTrue(telemetry.outputCurrent > 0.0, "driving must draw, was ${telemetry.outputCurrent}")
+        assertTrue(telemetry.power > 0.0, "driving must draw, was ${telemetry.power}")
+    }
+
+    @Test
+    fun torqueCurrentAgreeingWithTravelDirectionReturnsToThePack() {
+        val engine = LeaperKimProtocolEngine()
+        val braking = frame(page = 0).apply {
+            putInt16Be(6, 250)
+            putInt16Be(16, 480)     // same sign: on this firmware that is braking
+            putUInt16Be(34, 4_200)
+            putUInt16Be(4, 14_500)
+        }.withUpdatedCrc()
+
+        val telemetry = assertNotNull(engine.consume(braking))
+
+        assertTrue(telemetry.outputCurrent < 0.0, "braking must return, was ${telemetry.outputCurrent}")
+        assertTrue(telemetry.power < 0.0, "braking must return, was ${telemetry.power}")
+    }
+
+    @Test
+    fun ridingInReverseIsNotMistakenForRegeneration() {
+        val engine = LeaperKimProtocolEngine()
+        // Both words flip together: the wheel travels the other way under power, and the
+        // relationship between the two signs - which is what decides drive from brake - is
+        // unchanged. A test on the current sign alone would call this braking.
+        val reverse = frame(page = 0).apply {
+            putInt16Be(6, -250)
+            putInt16Be(16, 480)
+            putUInt16Be(34, 4_200)
+            putUInt16Be(4, 14_500)
+        }.withUpdatedCrc()
+
+        val telemetry = assertNotNull(engine.consume(reverse))
+
+        assertEquals(25.0, telemetry.speedKmh, 0.01)
+        assertTrue(telemetry.power > 0.0, "reverse under power still draws, was ${telemetry.power}")
+    }
 }
 
 private fun frame(page: Int, size: Int = 84): ByteArray = ByteArray(size).apply {
@@ -652,6 +830,9 @@ private fun frame(page: Int, size: Int = 84): ByteArray = ByteArray(size).apply 
     this[1] = 0x5A
     this[2] = 0x5C
     this[3] = (size - 4).toByte()
+    // Stock firmware fills main-frame @40..45 with 0x80 sentinels; mirror that so a synthetic
+    // frame that sets no motor temperature decodes it as unavailable, like a real one does.
+    for (i in 40..45) if (i < size) this[i] = 0x80.toByte()
     this[46] = page.toByte()
 }
 

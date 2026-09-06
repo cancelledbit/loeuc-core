@@ -133,7 +133,7 @@ class AlertFailureBoundaryTest {
             snapshot: TelemetrySnapshot,
             stateMap: Map<String, ConditionStateHistory>,
             keyPrefix: String,
-        ): Pair<Boolean, Map<String, ConditionStateHistory>> {
+        ): ConditionOutcome {
             if (keyPrefix == badAlertId) throw IllegalStateException("broken alert")
             return super.evaluateAlertConditions(items, snapshot, stateMap, keyPrefix)
         }

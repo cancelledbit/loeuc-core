@@ -9,6 +9,17 @@ enum class MetricId(
     val unit: String
 ) {
     SPEED_KMH("Скорость", "Speed", "км/ч"),
+
+    /**
+     * Speed as the phone's GNSS receiver reports it, not as the wheel reports it.
+     *
+     * Only present while GPS recording is on, and absent whenever the last fix is stale, so
+     * an alert built on it stops evaluating rather than reading a frozen number.
+     *
+     * Deliberately absent from `MetricIdSources`: this is the phone's metric, not the wheel's,
+     * and a consumer feeding wheel telemetry into the library has no fix to offer.
+     */
+    GPS_SPEED_KMH("Скорость по GPS", "GPS Speed", "км/ч"),
     PWM_PERCENT("ШИМ (PWM)", "PWM", "%"),
     VOLTAGE_V("Напряжение АКБ", "Battery Voltage", "В"),
     CELL_VOLTAGE_AVG_V("Среднее напр. ячейки", "Avg Cell Voltage", "В"),
@@ -20,6 +31,7 @@ enum class MetricId(
     TEMPERATURE_CONTROLLER_C("Температура контроллера", "Controller Temp", "°C"),
     TEMPERATURE_MOS_C("Температура мосфетов", "MOSFET Temp", "°C"),
     TEMPERATURE_MOTOR_C("Температура мотора", "Motor Temp", "°C"),
+    TEMPERATURE_BATTERY_C("Температура АКБ", "Battery Temp", "°C"),
     PITCH_DEG("Тангаж (Pitch)", "Pitch Angle", "°"),
     ROLL_DEG("Крен (Roll)", "Roll Angle", "°"),
     TRIP_DISTANCE_KM("Дистанция поездки", "Trip Distance", "км"),
@@ -28,7 +40,7 @@ enum class MetricId(
     fun displayName(isRu: Boolean = true): String = if (isRu) displayNameRu else displayNameEn
 
     fun unit(isRu: Boolean = true): String = when (this) {
-        SPEED_KMH -> if (isRu) "км/ч" else "km/h"
+        SPEED_KMH, GPS_SPEED_KMH -> if (isRu) "км/ч" else "km/h"
         TRIP_DISTANCE_KM, TOTAL_DISTANCE_KM -> if (isRu) "км" else "km"
         VOLTAGE_V, CELL_VOLTAGE_AVG_V, CELL_VOLTAGE_DELTA_V -> if (isRu) "В" else "V"
         CURRENT_A, PHASE_CURRENT_A -> if (isRu) "А" else "A"
