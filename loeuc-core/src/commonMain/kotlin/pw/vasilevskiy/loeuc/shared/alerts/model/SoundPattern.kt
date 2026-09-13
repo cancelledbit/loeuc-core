@@ -56,6 +56,27 @@ data class SoundPattern(
             )
         )
 
+        /**
+         * The wheel dropped off the link.
+         *
+         * Deliberately not an alarm timbre. Alarms are square waves above 2 kHz; this is two
+         * falling sine tones, a perfect fifth down, which every ear reads as "something
+         * powered off" and no ear mistakes for a PWM warning. A rider who hears it while
+         * riding must not brake for it.
+         *
+         * Short on purpose: it says "look at your phone", not "act now".
+         */
+        fun linkLost(isRu: Boolean = true) = SoundPattern(
+            id = "std_link_lost",
+            name = if (isRu) "Колесо отключилось" else "Wheel disconnected",
+            steps = listOf(
+                SoundStep(frequencyHz = 784, durationMs = 140, pauseAfterMs = 40, waveShape = WaveShape.SINE),
+                SoundStep(frequencyHz = 523, durationMs = 220, pauseAfterMs = 0, waveShape = WaveShape.SINE),
+            ),
+        )
+
+        val LINK_LOST = linkLost(true)
+
         val SINGLE_SHORT_BEEP = singleBeep(true)
         val DOUBLE_BEEP = doubleBeep(true)
         val TRIPLE_WARNING_ALARM = tripleWarningAlarm(true)

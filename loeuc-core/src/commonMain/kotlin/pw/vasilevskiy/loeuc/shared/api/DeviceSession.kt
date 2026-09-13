@@ -1,12 +1,27 @@
 package pw.vasilevskiy.loeuc.shared.api
 
 import pw.vasilevskiy.loeuc.shared.alerts.model.TelemetrySnapshot
+import pw.vasilevskiy.loeuc.shared.protocol.BegodeFirmware
 import pw.vasilevskiy.loeuc.shared.protocol.BegodeProtocolEngine
+import pw.vasilevskiy.loeuc.shared.protocol.BegodeSettingCapability
 import pw.vasilevskiy.loeuc.shared.protocol.BegodeTelemetry
 import pw.vasilevskiy.loeuc.shared.protocol.HwChargerProtocolEngine
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacyIdentity
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacyProtocolEngine
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacyRequests
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacySettingCapability
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacySettingWrite
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacySettings
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacySettingsCatalog
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacyUpdate
 import pw.vasilevskiy.loeuc.shared.protocol.InmotionProtocolEngine
 import pw.vasilevskiy.loeuc.shared.protocol.InmotionProtocolUpdate
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongIdentity
 import pw.vasilevskiy.loeuc.shared.protocol.KingSongProtocolEngine
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongSettingCapability
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongSettingWrite
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongSettingsCatalog
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongSettingsState
 import pw.vasilevskiy.loeuc.shared.protocol.KingSongTelemetry
 import pw.vasilevskiy.loeuc.shared.protocol.LeaperKimProtocolEngine
 import pw.vasilevskiy.loeuc.shared.protocol.LeaperKimTelemetry
@@ -86,14 +101,41 @@ data class DeviceBatterySnapshot(val packs: List<DeviceBatteryPack>) {
 /** Diagnostic codes exposed without manufacturing localized UI text in the protocol core. */
 data class DeviceDiagnostics(val codes: List<Int>)
 
-/** A setting discovered by a protocol engine. This public API exposes no write bytes. */
+/**
+ * A setting discovered by a protocol engine: its key, the value the device reported (null until
+ * it has) and whether a write for it can be built. The write itself is [WheelSession.writeSetting]
+ * or, for Ninebot, [WheelCommands.settingWrite].
+ */
 data class DeviceSettingCapability(val key: String, val value: Int?, val writable: Boolean)
+
+/** What [WheelSession.writeSetting] made of a request. */
+sealed interface SettingWriteResult {
+    /**
+     * Bytes for the caller to write, followed by [readbacks] - the reads that bring the device's
+     * own value back into the session's settings once the write has landed.
+     */
+    class Send(val command: ExperimentalWriteCommand, readbacks: List<ByteArray>) : SettingWriteResult {
+        private val reads: List<ByteArray> = readbacks.map { it.copyOf() }
+        val readbacks: List<ByteArray> get() = reads.map { it.copyOf() }
+    }
+
+    /**
+     * Queued inside the session. It goes out through [WheelSession.nextRequest] when the device is
+     * free, and the session re-reads the settings afterwards on its own; [command] is for
+     * inspection, not for sending a second time.
+     */
+    class Queued(val command: ExperimentalWriteCommand) : SettingWriteResult
+
+    /** Nothing was built or queued. */
+    data class Rejected(val reason: String) : SettingWriteResult
+}
 
 /** Brand-specific update, avoiding an untyped `Any` boundary for Kotlin/Native consumers. */
 sealed interface WheelBrandUpdate {
     data class Begode(val telemetry: BegodeTelemetry) : WheelBrandUpdate
     data class KingSong(val telemetry: KingSongTelemetry) : WheelBrandUpdate
     data class Inmotion(val update: InmotionProtocolUpdate) : WheelBrandUpdate
+    data class InmotionLegacy(val update: InmotionLegacyUpdate) : WheelBrandUpdate
     data class LeaperKim(val telemetry: LeaperKimTelemetry) : WheelBrandUpdate
     data class Ninebot(val update: NinebotProtocolUpdate) : WheelBrandUpdate
     data class SolowheelXtreme(val telemetry: SolowheelXtremeTelemetry) : WheelBrandUpdate
@@ -112,7 +154,15 @@ data class TelemetryUpdate(
     val brand: WheelBrandUpdate,
 )
 
-/** Command surface backed directly by the existing protocol engines. */
+/**
+ * Command surface backed directly by the existing protocol engines.
+ *
+ * For [WheelProtocol.InmotionLegacy] these are the three requests of its session - PIN and slow
+ * info as [initialReads], fast info as [telemetryPoll] - for a transport that can only send a
+ * fixed schedule. A wheel of that family answers one request at a time and the next question
+ * depends on the last answer, so a transport that can react to notifications should drive
+ * [WheelSession.nextRequest] instead, and never both.
+ */
 class WheelCommands internal constructor(
     private val protocol: WheelProtocol,
     val initialReads: List<ByteArray>,
@@ -135,6 +185,7 @@ class WheelSession private constructor(
     private val begode = BegodeProtocolEngine()
     private val kingSong = KingSongProtocolEngine()
     private val inmotion = InmotionProtocolEngine()
+    private val inmotionLegacy = InmotionLegacyProtocolEngine()
     private val leaperKim = LeaperKimProtocolEngine()
     private val ninebot = NinebotProtocolEngine()
     private val solowheel = SolowheelXtremeProtocolEngine()
@@ -165,6 +216,11 @@ class WheelSession private constructor(
             WheelProtocol.Inmotion -> inmotion.consume(chunk)?.let { update ->
                 listOf(WheelBrandUpdate.Inmotion(update) to (update.telemetry?.toDeviceTelemetry() ?: DeviceTelemetry.of()))
             }.orEmpty()
+            WheelProtocol.InmotionLegacy -> inmotionLegacy.consume(chunk, timestampMs)
+                .takeIf { it.messages.isNotEmpty() }
+                ?.let { update ->
+                    listOf(WheelBrandUpdate.InmotionLegacy(update) to (update.telemetry?.toDeviceTelemetry() ?: DeviceTelemetry.of()))
+                }.orEmpty()
             WheelProtocol.LeaperKim, WheelProtocol.Nosfet -> leaperKim.consume(chunk)?.let { listOf(WheelBrandUpdate.LeaperKim(it) to it.toDeviceTelemetry()) }.orEmpty()
             WheelProtocol.Ninebot -> ninebot.consume(chunk).map { it to it.toDeviceTelemetry() }.map { (update, mapped) -> WheelBrandUpdate.Ninebot(update) to mapped }
             WheelProtocol.SolowheelXtreme -> solowheel.consume(chunk)?.let { listOf(WheelBrandUpdate.SolowheelXtreme(it) to it.toDeviceTelemetry()) }.orEmpty()
@@ -172,9 +228,126 @@ class WheelSession private constructor(
         return results.map { (brand, delta) -> publish(timestampMs, brand, delta) }
     }
 
+    /**
+     * The request to write now, or null when nothing is due. Only [WheelProtocol.InmotionLegacy]
+     * has such a conversation; every other protocol returns null and is served by [commands].
+     *
+     * A legacy wheel sends nothing until asked. Write what this returns (in chunks of at most
+     * 20 bytes), call it again after every [ingest] and on a short timer - 25 ms is what the
+     * reference client uses - and report a write that did not go out with [onWriteFailed]. The
+     * sequence is the default PIN, slow info until the wheel identifies itself, then fast info as
+     * telemetry and keep-alive; none of it changes anything stored on the wheel.
+     *
+     * @param timestampMs the same monotonic clock passed to [ingest]; the pacing is measured on it.
+     */
+    fun nextRequest(timestampMs: Long): ByteArray? = when (protocol) {
+        WheelProtocol.InmotionLegacy -> inmotionLegacy.nextRequest(timestampMs)
+        else -> null
+    }
+
+    /** The request [nextRequest] last returned could not be written; it is retried shortly. */
+    fun onWriteFailed(timestampMs: Long) {
+        if (protocol == WheelProtocol.InmotionLegacy) inmotionLegacy.onWriteFailed(timestampMs)
+    }
+
+    /** KingSong: name, firmware and serial as far as the wheel has answered; null for other protocols. */
+    val kingSongIdentity: KingSongIdentity?
+        get() = kingSong.identity().takeIf { protocol == WheelProtocol.KingSong }
+
+    /** KingSong: the settings the wheel has reported back; null for other protocols. */
+    val kingSongSettings: KingSongSettingsState?
+        get() = kingSong.settings().takeIf { protocol == WheelProtocol.KingSong }
+
+    /** Begode: the firmware that answered `V`, which decides how custom-firmware frames read; null until then. */
+    val begodeFirmware: BegodeFirmware?
+        get() = begode.firmware().takeIf { protocol == WheelProtocol.Begode }
+
+    /** Legacy InMotion: the identity from the latest slow info reply, or null. */
+    val inmotionLegacyIdentity: InmotionLegacyIdentity?
+        get() = inmotionLegacy.identity.takeIf { protocol == WheelProtocol.InmotionLegacy }
+
+    /** Legacy InMotion: the settings from the latest slow info reply, or null. */
+    val inmotionLegacySettings: InmotionLegacySettings?
+        get() = inmotionLegacy.settings.takeIf { protocol == WheelProtocol.InmotionLegacy }
+
+    /** KingSong settings rows with titles, ranges and options; empty for other protocols. */
+    fun kingSongSettingRows(): List<KingSongSettingCapability> =
+        kingSongSettings?.let(KingSongSettingsCatalog::capabilities).orEmpty()
+
+    /** Begode settings rows, including the rows a custom firmware adds; empty for other protocols. */
+    fun begodeSettingRows(): List<BegodeSettingCapability> =
+        if (protocol == WheelProtocol.Begode) begode.settingsCapabilities() else emptyList()
+
+    /** Legacy InMotion settings rows with titles, value text and the model's ranges; empty before slow info. */
+    fun inmotionLegacySettingRows(): List<InmotionLegacySettingCapability> {
+        val settings = inmotionLegacySettings ?: return emptyList()
+        return InmotionLegacySettingsCatalog.capabilities(inmotionLegacy.identity, settings)
+    }
+
+    /**
+     * Builds the write that sets [key] to [value] from what the device has reported so far.
+     *
+     * - [WheelProtocol.KingSong]: [SettingWriteResult.Send] with the frame and the reads that
+     *   confirm it. The speed alarms share one frame, so they are rejected until the wheel has
+     *   reported all four.
+     * - [WheelProtocol.InmotionLegacy]: [SettingWriteResult.Queued]. The command waits in the
+     *   session and leaves through [nextRequest], followed by a slow info re-read that replaces
+     *   the sent value with the wheel's in [inmotionLegacySettings]. Rejected until slow info has
+     *   named the model and carried the field.
+     * - Every other protocol: [SettingWriteResult.Rejected]; Ninebot writes are
+     *   [WheelCommands.settingWrite].
+     *
+     * Nothing here has been confirmed on hardware; see [ExperimentalCommands].
+     */
+    @ExperimentalWriteApi
+    fun writeSetting(key: String, value: Int): SettingWriteResult = when (protocol) {
+        WheelProtocol.KingSong -> when (val write = KingSongSettingsCatalog.write(key, value, kingSong.settings())) {
+            is KingSongSettingWrite.Command -> SettingWriteResult.Send(
+                command = ExperimentalWriteCommand.create(
+                    protocol = protocol,
+                    purpose = key,
+                    bytes = write.bytes,
+                    validation = CommandValidation(
+                        CommandStatus.UNTESTED,
+                        "Built by KingSongSettingsCatalog; WheelLog and the official app agree on the " +
+                            "bytes. Not confirmed on hardware.",
+                    ),
+                ),
+                readbacks = KingSongSettingsCatalog.readsFor(key),
+            )
+            is KingSongSettingWrite.Rejected -> SettingWriteResult.Rejected(write.reason)
+        }
+        WheelProtocol.InmotionLegacy -> when (
+            val write = InmotionLegacySettingsCatalog.write(key, value, inmotionLegacy.identity, inmotionLegacy.settings)
+        ) {
+            is InmotionLegacySettingWrite.Command -> {
+                val bytes = write.bytes
+                if (inmotionLegacy.enqueue(bytes)) {
+                    SettingWriteResult.Queued(
+                        ExperimentalWriteCommand.create(
+                            protocol = protocol,
+                            purpose = key,
+                            bytes = bytes,
+                            validation = CommandValidation(
+                                CommandStatus.UNTESTED,
+                                "Built by InmotionLegacySettingsCatalog after WheelLog's adapter and " +
+                                    "cross-checked against the official app; not confirmed on hardware.",
+                            ),
+                        ),
+                    )
+                } else {
+                    SettingWriteResult.Rejected("The session already holds the most commands it queues.")
+                }
+            }
+            is InmotionLegacySettingWrite.Rejected -> SettingWriteResult.Rejected(write.reason)
+        }
+        else -> SettingWriteResult.Rejected("No session setting writes for $protocol.")
+    }
+
     /** Resets the decoder and every accumulated projection. */
     fun reset() {
         begode.reset(); kingSong.reset(); inmotion.reset(); leaperKim.reset(); ninebot.reset(); solowheel.reset()
+        inmotionLegacy.reset()
         accumulated = DeviceTelemetry.of()
         accumulatedBattery = null
         accumulatedDiagnostics = null
@@ -217,7 +390,11 @@ class WheelSession private constructor(
         is WheelBrandUpdate.Ninebot -> ninebot.settingsCapabilities().map { it.toDeviceSettingCapability() }
         is WheelBrandUpdate.Inmotion -> inmotion.settingsCapabilities().map { it.toDeviceSettingCapability() }
         is WheelBrandUpdate.LeaperKim -> leaperKim.settingsCapabilities().map { it.toDeviceSettingCapability() }
-        else -> emptyList()
+        is WheelBrandUpdate.InmotionLegacy ->
+            inmotionLegacy.settings?.toDeviceSettingCapabilities(inmotionLegacy.identity).orEmpty()
+        is WheelBrandUpdate.KingSong -> KingSongSettingsCatalog.capabilities(kingSong.settings()).map { it.toDeviceSettingCapability() }
+        is WheelBrandUpdate.Begode -> begode.settingsCapabilities().map { it.toDeviceSettingCapability() }
+        is WheelBrandUpdate.SolowheelXtreme -> emptyList()
     }
 
     private fun batteryFor(brand: WheelBrandUpdate): DeviceBatterySnapshot? = when (brand) {
@@ -227,6 +404,7 @@ class WheelSession private constructor(
         is WheelBrandUpdate.LeaperKim -> leaperKim.bmsSnapshot().toBatterySnapshot()
         is WheelBrandUpdate.Ninebot -> (brand.update.bmsPacks ?: ninebot.bmsPacks()).toNinebotBatterySnapshot()
         is WheelBrandUpdate.SolowheelXtreme -> null
+        is WheelBrandUpdate.InmotionLegacy -> null
     }
 
     companion object {
@@ -238,6 +416,7 @@ class WheelSession private constructor(
         WheelProtocol.KingSong -> WheelCommands(protocol, kingSong.initialReadCommands(), kingSong.telemetryPollingCommand(), emptyList())
         WheelProtocol.Ninebot -> WheelCommands(protocol, ninebot.initialReadCommands(), ninebot.telemetryPollingCommand(), ninebot.bmsPollingCommands())
         WheelProtocol.Inmotion -> WheelCommands(protocol, listOf(inmotion.mainInfoCommand(), inmotion.versionInfoCommand(), inmotion.settingsCommand(), inmotion.settingsAllCommand()), inmotion.realtimeCommand(), inmotion.bmsReadCommands())
+        WheelProtocol.InmotionLegacy -> WheelCommands(protocol, listOf(InmotionLegacyRequests.pin(), InmotionLegacyRequests.slowInfo()), InmotionLegacyRequests.fastInfo(), emptyList())
         else -> WheelCommands(protocol, emptyList(), null, emptyList())
     }
 }

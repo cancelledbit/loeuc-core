@@ -1,5 +1,6 @@
 package pw.vasilevskiy.loeuc.shared.api
 
+import pw.vasilevskiy.loeuc.shared.protocol.BegodeSettingCapability
 import pw.vasilevskiy.loeuc.shared.protocol.BegodeTelemetry
 
 /** Metres per kilometre, for brands that report distance in metres. */
@@ -24,3 +25,11 @@ fun BegodeTelemetry.toDeviceTelemetry(): DeviceTelemetry = DeviceTelemetry.of(
     DeviceMetric.TripDistanceKm to tripDistanceMeters / MetresPerKilometre,
     DeviceMetric.TotalDistanceKm to totalDistanceKm,
 )
+
+/**
+ * A Begode settings row under the neutral shape. Begode reports only some of its settings back,
+ * so a writable row can still have no value. The session builds no Begode writes: they are
+ * sequences with pauses between the steps, see `BegodeSettingsCatalog.writeSteps`.
+ */
+fun BegodeSettingCapability.toDeviceSettingCapability(): DeviceSettingCapability =
+    DeviceSettingCapability(key, rawValue, writable = isSupported && commandId != null)

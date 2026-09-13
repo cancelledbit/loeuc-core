@@ -28,9 +28,10 @@ library retains, and where the threading and clock boundaries are.
 
 | Protocol | `WheelProtocol` / `ChargerProtocol` | Notes |
 | --- | --- | --- |
-| Begode | `Begode` | Legacy and modern frames, per-cell battery curve |
-| KingSong | `KingSong` | Telemetry and BMS pages |
+| Begode | `Begode` | Legacy and modern frames, per-cell battery curve, firmware family (stock, Freestyl3r, SmirnoV), settings rows |
+| KingSong | `KingSong` | Telemetry, BMS pages, identity, settings with writes |
 | InMotion | `Inmotion` | V11/V12/V13/V14/P6 telemetry, BMS, diagnostics, settings block |
+| InMotion V5/V8/V10 | `InmotionLegacy` | Older CAN-over-BLE protocol (also Solowheel Glide 3): telemetry, identity, settings with writes. Silent until asked - drive `WheelSession.nextRequest` |
 | Leaperkim | `LeaperKim` | Lynx S / Patton pages, BMS, settings, diagnostic co-stream |
 | NOSFET | `Nosfet` | Aero, Aeon, Apex and Xeno speak the Leaperkim protocol; same engine, separate identity |
 | Ninebot Z | `Ninebot` | Framing with response-envelope validation, settings catalog |
@@ -112,6 +113,23 @@ command.validation.status    // UNTESTED
 command.validation.evidence  // where the bytes came from
 command.bytes                // yours to send, or not
 ```
+
+Where a write depends on what the device has reported - the model's range, or the other values
+that share a frame - `WheelSession.writeSetting` builds it from the session's own state:
+
+```kotlin
+@OptIn(ExperimentalWriteApi::class)
+when (val result = session.writeSetting(key, value)) {
+    is SettingWriteResult.Send -> { send(result.command.bytes); result.readbacks.forEach(::send) } // KingSong
+    is SettingWriteResult.Queued -> Unit     // legacy InMotion: leaves through nextRequest, then re-reads
+    is SettingWriteResult.Rejected -> show(result.reason)
+}
+```
+
+`TelemetryUpdate.settings` marks which keys are `writable`; the brand's settings catalogue
+(`KingSongSettingsCatalog`, `InmotionLegacySettingsCatalog`, `BegodeSettingsCatalog`) has the titles,
+ranges and options. The value a row shows is always the one the device reported, never the one
+last sent.
 
 The library still sends nothing. Gyroscope calibration is deliberately absent on every brand:
 the real procedure needs the wheel physically levelled first, and no application can verify

@@ -44,6 +44,8 @@ object WheelSettingGroups {
         "inmotion_pedal_sensitivity_1",
         "inmotion_pedal_sensitivity_2",
         "ninebot_pedal_sensitivity",
+        "inmotion_legacy_pedal_hardness",
+        "kingsong_pedal_mode",
     )
 
     /**
@@ -84,6 +86,32 @@ object WheelSettingGroups {
             "ninebot_pedal_sensitivity",
             "ninebot_brake_assist",
             "ninebot_handle_button",
+            "begode_ride_mode",
+            "begode_pedal_dip",
+            "begode_pedal_trim",
+            "begode_side_tilt_threshold",
+            "begode_side_tilt_angle",
+            "kingsong_pedal_mode",
+            "begode_bf_pedal_mode",
+            "begode_bf_trick",
+            "begode_bf_extreme_mode",
+            "begode_bf_braking_current",
+            "begode_bf_rotation_control",
+            "begode_bf_rotation_angle",
+            "begode_bf_advanced_settings",
+            "begode_bf_pid_p",
+            "begode_bf_pid_i",
+            "begode_bf_pid_d",
+            "begode_bf_dynamic_compensation",
+            "begode_bf_dynamic_compensation_filter",
+            "begode_bf_acceleration_compensation",
+            "begode_bf_current_q_p",
+            "begode_bf_current_q_i",
+            "begode_bf_current_d_p",
+            "begode_bf_current_d_i",
+            "inmotion_legacy_pedal_hardness",
+            "inmotion_legacy_pedal_tilt",
+            "inmotion_legacy_ride_mode",
             -> Ride
 
             "inmotion_speed_limit",
@@ -101,6 +129,16 @@ object WheelSettingGroups {
             "ninebot_alarm_1_speed",
             "ninebot_alarm_2_speed",
             "ninebot_alarm_3_speed",
+            "begode_tiltback_speed",
+            "begode_speed_alarms",
+            "begode_field_weakening",
+            "kingsong_alarm_1_speed",
+            "kingsong_alarm_2_speed",
+            "kingsong_alarm_3_speed",
+            "kingsong_max_speed",
+            "inmotion_speed_limit_unlock",
+            "begode_cf_pwm_tiltback",
+            "inmotion_legacy_max_speed",
             -> Speed
 
             "inmotion_auto_light_state",
@@ -128,6 +166,12 @@ object WheelSettingGroups {
             "ninebot_led_color_2",
             "ninebot_led_color_3",
             "ninebot_led_color_4",
+            "begode_led_mode",
+            "kingsong_light_mode",
+            "kingsong_led_strip",
+            "kingsong_strobe",
+            "inmotion_legacy_headlight",
+            "inmotion_legacy_decorative_light",
             -> Light
 
             "inmotion_audio_switch",
@@ -135,6 +179,9 @@ object WheelSettingGroups {
             "inmotion_active_sound",
             "inmotion_active_sound_sensitivity",
             "ninebot_speaker_volume",
+            "begode_buzzer_volume",
+            "kingsong_voice_prompts",
+            "inmotion_legacy_speaker_volume",
             -> Sound
 
             "inmotion_charge_cut_off_percent",
@@ -143,6 +190,9 @@ object WheelSettingGroups {
             "inmotion_low_battery_ride",
             "inmotion_dual_battery_mode",
             "inmotion_range_estimate",
+            "kingsong_charge_limit",
+            "begode_power_margin",
+            "begode_power_margin_tiltback",
             -> Battery
 
             "inmotion_lift_up_detection",
@@ -154,6 +204,7 @@ object WheelSettingGroups {
             "inmotion_tpms_low_alarm_threshold",
             "inmotion_shield_tps_error",
             "ninebot_lock_mode",
+            "inmotion_legacy_handle_button",
             -> Safety
 
             "inmotion_standby_time",
@@ -164,6 +215,11 @@ object WheelSettingGroups {
             "inmotion_fan_mute_mode",
             "inmotion_tbox_low_battery_wakeup",
             "inmotion_show_tbox_info",
+            "kingsong_standby_delay",
+            "inmotion_metric_unit",
+            "begode_firmware",
+            "begode_units",
+            "begode_auto_power_off",
             -> System
 
             else -> Other

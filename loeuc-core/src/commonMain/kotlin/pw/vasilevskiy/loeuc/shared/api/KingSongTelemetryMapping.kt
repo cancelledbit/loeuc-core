@@ -1,5 +1,6 @@
 package pw.vasilevskiy.loeuc.shared.api
 
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongSettingCapability
 import pw.vasilevskiy.loeuc.shared.protocol.KingSongTelemetry
 
 /**
@@ -20,3 +21,11 @@ fun KingSongTelemetry.toDeviceTelemetry(): DeviceTelemetry = DeviceTelemetry.of(
     DeviceMetric.TripDistanceKm to tripDistanceMeters / MetresPerKilometre,
     DeviceMetric.TotalDistanceKm to totalDistanceKm,
 )
+
+/**
+ * A KingSong settings row under the neutral shape. A row is writable when it has a command, even
+ * before the wheel has reported its value - except that the speed-alarm write is refused until
+ * all four speeds are known, which [WheelSession.writeSetting] reports as a rejection.
+ */
+fun KingSongSettingCapability.toDeviceSettingCapability(): DeviceSettingCapability =
+    DeviceSettingCapability(key, rawValue.takeIf { isSupported }, writable = isSupported && commandId != null)

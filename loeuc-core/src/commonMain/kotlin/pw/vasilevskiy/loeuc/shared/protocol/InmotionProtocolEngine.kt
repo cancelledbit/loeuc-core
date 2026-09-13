@@ -95,7 +95,7 @@ data class InmotionDiagnosticsSnapshot(
 /**
  * EUC settings (command 0x08) writable fields. Offsets and command ids are
  * confirmed against the decompiled official app; see docs/inmotion-protocol-notes.md.
- * V12-family (HS/HT/PRO/S) and V14-family (50GB/50S, plus P6 by inference) use
+ * V12-family (HS/HT/PRO) and V14-family (50GB/50S, plus P6 by inference) use
  * different byte layouts internally — see [InmotionProtocolEngine.settingsCommand]'s
  * private parsers — but expose overlapping keys where the underlying setting is
  * the same logical field (e.g. auto-light thresholds).
@@ -362,6 +362,39 @@ class InmotionProtocolEngine {
     /** Whether [v11HeadlightCommand] has what it needs, so a caller can gate UI on it. */
     fun mainBoardVersionKnown(): Boolean = mainBoardVersion != null
 
+    /**
+     * The wheel's horn: Control(`0x60`) subcommand `0x51`, "play in-vehicle sound effect",
+     * with a sound id and a second byte. Null until main info has named the model, and null
+     * for every model where the two sources below do not agree on all three bytes.
+     *
+     * Validation: WheelLog + InMotion Pro decompile agree on bytes, per model.
+     * - V12 HS/HT/Pro, V12S, V9: `51 18 01`. The decompile's base `LorinProtocol.horn` passes
+     *   sound id `0x18` and leaves the second byte at its default of 1; none of these models
+     *   overrides it. WheelLog's `playSound(0x18)` sends the same.
+     * - V11Y: `51 02 64`. `V11yProtocol.horn` overrides the id to 2 and passes `status: 100`;
+     *   WheelLog's `playBeep(0x02)` sends the same.
+     * - V11: `51 18 01` from the base class, which WheelLog sends only on main-board firmware
+     *   1.4 and up (below that it uses `0x41`, which the current app no longer knows), so the
+     *   version block has to have been answered first - the same fork as [v11HeadlightCommand].
+     *
+     * Not built, because the sources disagree: V14 (`V14Protocol.horn` sends `51 02 01`,
+     * WheelLog `51 02 64`) and V13 (the decompile's base `51 18 01`, WheelLog `51 02 64`). P6
+     * has the base-class bytes in the decompile but no WheelLog support at all, so it stays
+     * decompile-only and unbuilt too.
+     */
+    @ExperimentalWriteApi
+    fun hornCommand(): ByteArray? {
+        val soundEffect = when (modelId) {
+            in V12_MODELS, MODEL_V12S, MODEL_V9 -> HORN_DEFAULT
+            MODEL_V11Y -> HORN_V11Y
+            MODEL_V11 -> mainBoardVersion
+                ?.takeUnless { version -> version.major < 2 && version.minor < 4 }
+                ?.let { HORN_DEFAULT }
+            else -> null
+        } ?: return null
+        return buildControlCommand(SUB_PLAY_SOUND_EFFECT, soundEffect)
+    }
+
     fun bmsRealtimeCommand(): ByteArray? =
         if (modelId == MODEL_P6) {
             buildMessage(flag = FLAG_DEFAULT, command = COMMAND_BATTERY_REALTIME, data = byteArrayOf())
@@ -477,16 +510,25 @@ class InmotionProtocolEngine {
                 modelId in V12_MODELS -> data.toV12SettingCapabilities()
                 modelId in V14_MODELS || modelId == MODEL_P6 -> data.toV14SettingCapabilities()
                 modelId == MODEL_V11 -> data.toV11SettingCapabilities()
+                // These four keep their block in `0x20`: an `0x08` answer arriving after it - a
+                // retry, or the readback that asks both - must not wipe what was just parsed.
+                modelId in V13_MODELS || modelId == MODEL_V11Y ||
+                    modelId == MODEL_V12S || modelId == MODEL_V9 -> settings
                 else -> emptyList()
             }
         }
         // Which of the two reads a wheel answers is model business: P6 answers only
         // `0x20`, and V11 is not known to answer either yet, so its block is parsed
-        // from whichever one comes back.
+        // from whichever one comes back. V13, V11Y, V12S and V9 are parsed from `0x20`
+        // only - that is the read WheelLog's captures from all four answer.
         if (command == COMMAND_SETTINGS_ALL) {
             val parsed = when {
                 modelId == MODEL_P6 -> data.toP6SettingCapabilities()
                 modelId == MODEL_V11 -> data.toV11SettingCapabilities()
+                modelId in V13_MODELS -> data.toV13FamilySettingCapabilities(isV11y = false)
+                modelId == MODEL_V11Y -> data.toV13FamilySettingCapabilities(isV11y = true)
+                modelId == MODEL_V12S -> data.toV12sFamilySettingCapabilities(isV9 = false)
+                modelId == MODEL_V9 -> data.toV12sFamilySettingCapabilities(isV9 = true)
                 else -> emptyList()
             }
             parsed.takeIf { it.isNotEmpty() }?.let { settings = it }
@@ -587,6 +629,12 @@ class InmotionProtocolEngine {
             modelId == MODEL_P6 && size >= 54 -> toV14FamilyTelemetry("inmotion_p6", hasTirePressure = true)
             modelId in V14_MODELS && size >= 55 -> toV14FamilyTelemetry("inmotion_v14")
             modelId in V13_MODELS && size >= 55 -> toV14FamilyTelemetry("inmotion_v13")
+            // Same fields as a V14, so the same dashboard profile: every metric the V14 layout
+            // offers is present on these wheels too, and none that it lacks.
+            modelId in V14_LAYOUT_MODELS && size >= 55 -> toV14FamilyTelemetry("inmotion_v14")
+            // A known model whose frame is too short for its own layout is not decoded with a
+            // different model's offsets - that is exactly how V12S used to read V12 bytes.
+            modelId in V14_LAYOUT_MODELS -> null
             modelId in V12_MODELS && size >= 47 -> toV12Telemetry()
             modelId == MODEL_V11 && size < 51 -> toV11LegacyTelemetry()
             modelId == MODEL_V11 && size >= 58 -> toV11NewTelemetry()
@@ -820,6 +868,8 @@ internal const val KEY_LOCK_MODE = "inmotion_lock_mode"
 internal const val KEY_TRANSPORT_MODE = "inmotion_transport_mode"
 internal const val KEY_LIFT_UP_DETECTION = "inmotion_lift_up_detection"
 internal const val KEY_STANDBY_TIME = "inmotion_standby_time"
+internal const val KEY_SPEED_LIMIT_UNLOCK = "inmotion_speed_limit_unlock"
+internal const val KEY_METRIC_UNIT = "inmotion_metric_unit"
 
 /**
  * The settings block stores speeds in hundredths of km/h and the pedal-pitch trim in
@@ -919,6 +969,17 @@ private const val STANDBY_MAX_MINUTES = 60
 private const val HEADLIGHT_SUB_PRE_1_4 = 0x40
 private const val HEADLIGHT_SUB_1_4_PLUS = 0x50
 
+/**
+ * `LorinCmd.playInVehicleSoundEffectCmd`, the id both `playInVehicleSoundEffect` and `horn`
+ * build their request with. See [InmotionProtocolEngine.hornCommand] for the parameters.
+ */
+private const val SUB_PLAY_SOUND_EFFECT = 0x51
+
+/** `setAutoHeadlightModeSwitch` - the literal behind every auto-headlight toggle in this file. */
+private const val SUB_AUTO_HEADLIGHT = 0x2F
+private val HORN_DEFAULT = byteArrayOf(0x18, 0x01)
+private val HORN_V11Y = byteArrayOf(0x02, 0x64)
+
 /** Tyre-pressure alarm is exposed in millibar; the block stores hundred-thousandths of a bar. */
 private const val TPMS_SCALE = 10
 private const val TPMS_MAX_MBAR = 5_000
@@ -935,10 +996,31 @@ private fun int16LeBytes(value: Int): ByteArray {
     return byteArrayOf((clamped and 0xFF).toByte(), ((clamped shr 8) and 0xFF).toByte())
 }
 private const val MODEL_V11 = 61
+private const val MODEL_V11Y = 62
+private const val MODEL_V12S = 111
+private const val MODEL_V9 = 121
 private const val MODEL_P6 = 131
 private val V14_MODELS = setOf(91, 92)
 private val V13_MODELS = setOf(81, 82)
-private val V12_MODELS = setOf(71, 72, 73, 111)
+
+/**
+ * V12 HS / HT / Pro. V12S (111) is deliberately not here: despite the name it shares neither
+ * the V12 realtime layout nor the V12 settings block - see [V14_LAYOUT_MODELS] and
+ * [toV12sFamilySettingCapabilities].
+ */
+private val V12_MODELS = setOf(71, 72, 73)
+
+/**
+ * Models whose `0x04` realtime answer uses the V14 byte layout without being a V14.
+ *
+ * The InMotion Pro parsers `V11yRealtimeInfo`, `V12sRealtimeInfo` and `V9RealtimeInfo`
+ * (`lorin/realtime/info/`) are the same machine code as `V14RealtimeInfo` field for field -
+ * speed @8, output rate @14, battery/motor power @16/@18, battery percentages @34/@36,
+ * thresholds from @40, temperatures from @58 - with V12S and V9 adding one `lte_signal` byte
+ * @69 that nothing here reads. WheelLog's dedicated V11y/V9/V12S parsers read the same offsets,
+ * and its captured frames for all three decode to plausible values through them.
+ */
+private val V14_LAYOUT_MODELS = setOf(MODEL_V11Y, MODEL_V12S, MODEL_V9)
 private val DIRECT_BMS_ADDRESSES = listOf(0x24, 0x25, 0x26, 0x27, 0x32, 0x34)
 private val DIRECT_BMS_SELECTORS = listOf(0x01, 0x02, 0x04)
 
@@ -1113,6 +1195,155 @@ private fun ByteArray.toV11SettingCapabilities(): List<InmotionSettingCapability
         setting(KEY_QUIET_FAN, "Quiet fan mode", "Тихий режим вентилятора", packed(22, 4), 22),
         setting(KEY_FAN, "Fan", "Вентилятор", packed(22, 6), 22),
     )
+}
+
+/**
+ * `V13Settings.fromBytes` and `V11ySettings.fromBytes` (`lorin/settings/`), relative to the
+ * `getSettingsAll` (`0x20`) payload, joined to their `toMap` keys through the object field
+ * offsets - the method the P6 and V11 layouts were read with. Both parsers reject payloads
+ * below 38 bytes. V13 Pro's parser is byte-identical to V13's.
+ *
+ * The two differ in three places only: V13 names byte 25 `lamp_brightness`, V11Y
+ * `low_lamp_brightness`, and V11Y adds `charge_cut_off_battery_percent` at 26.
+ *
+ * WheelLog reads the same block for both models (`parseSettingsV13` / `parseSettingsV11y`, its
+ * `i + n` being payload offset `n`) and agrees on every field it names: speed limit @0, first
+ * warning speed @2, pedal trim @8, the mode nibbles @10, both pedal sensitivities, the assist
+ * pair @13/@14, standby @20, and the packed bits for sound, DRL, lift-up, transport, low
+ * battery ride, assist and berm-angle mode.
+ *
+ * Bytes 30..33 hold four two-bit fields each at positions 0/2/4/6 (byte 33 packs a four-bit
+ * `usb_power_switch` at 2 instead), byte 34 two two-bit fields and two single bits. The raw
+ * field value is shown, as on V11.
+ *
+ * Writable, with readback from this block: voice volume (`0x26`), sound (`0x2C`) and auto
+ * headlight (`0x2F`). For those three the decompile's setters carry the id as a literal shared
+ * by every model and WheelLog sends the same bytes. Everything else is display-only: for these
+ * models WheelLog sends speed limit and warning speed together in four bytes where the existing
+ * speed write sends two, DRL resolves to `0x4E` in the decompile but `0x2D` in WheelLog,
+ * berm-angle mode to `0x43` against `0x45`, the brightness and standby setters take their id
+ * from a per-model getter none of these models' command classes defines, and the pedal and
+ * speed rows are felt through the rider's feet, which wants a real write before it is trusted.
+ */
+private fun ByteArray.toV13FamilySettingCapabilities(isV11y: Boolean): List<InmotionSettingCapability> {
+    if (size < 38) {
+        return emptyList()
+    }
+    fun packed(offset: Int, position: Int, mask: Int = 0x3) = (u8(offset) shr position) and mask
+    return buildList {
+        add(setting(KEY_SPEED_LIMIT, "Speed limit, km/h", "Ограничение скорости, км/ч", uint16Le(0) / SPEED_SCALE, 0))
+        add(setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Порог предупреждения 1, км/ч", uint16Le(2) / SPEED_SCALE, 2))
+        add(setting(KEY_PITCH_ZERO, "Pedal angle trim, 0.1°", "Угол педалей, 0.1°", int16Le(8) / PITCH_SCALE, 8))
+        add(setting("inmotion_driver_mode", "Controller mode", "Режим контроллера", u8(10) and 0xF, 10))
+        add(setting(KEY_RIDE_MODE, "Pedal mode", "Режим педалей", (u8(10) shr 4) and 0xF, 10))
+        add(setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Чувствительность педалей 1", u8(11), 11))
+        add(setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Чувствительность педалей 2", u8(12), 12))
+        add(setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Ассист разгона, %", int8(13), 13))
+        add(setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Ассист торможения, %", int8(14), 14))
+        add(setting(KEY_VOICE_VOLUME, "Voice volume", "Громкость озвучки", u8(15), 15, SUB_VOLUME, 0, 100, "slider"))
+        add(setting(KEY_STANDBY_TIME, "Standby timeout, min", "Режим ожидания, мин", uint16Le(20) / STANDBY_SCALE, 20))
+        add(setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Режим светодиодных эффектов", u8(22), 22))
+        add(setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Порог датчика автосвета (низкий)", u8(23), 23))
+        add(setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Порог датчика автосвета (высокий)", u8(24), 24))
+        if (isV11y) {
+            add(setting(KEY_LOW_BEAM_BRIGHTNESS, "Low beam brightness", "Яркость ближнего света", u8(25), 25))
+            add(setting("inmotion_charge_cut_off_percent", "Charge cut-off, %", "Ограничение заряда, %", u8(26), 26))
+        } else {
+            add(setting(KEY_LIGHT_BRIGHTNESS, "Headlight brightness", "Яркость света", u8(25), 25))
+        }
+        add(setting(KEY_AUDIO_SWITCH, "Sound", "Звук", packed(30, 0), 30, SUB_VOICE_SWITCH, 0, 1, "toggle"))
+        add(setting(KEY_DRL_STATE, "Daytime running lights", "Дневные ходовые огни", packed(30, 2), 30))
+        add(setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Датчик поднятия", packed(30, 4), 30))
+        add(setting(KEY_AUTO_LIGHT_STATE, "Auto headlight", "Автосвет", packed(30, 6), 30, SUB_AUTO_HEADLIGHT, 0, 1, "toggle"))
+        add(setting("inmotion_auto_brightness", "Auto brightness", "Автояркость", packed(31, 0), 31))
+        add(setting(KEY_LOCK_MODE, "Wheel lock", "Замок колеса", packed(31, 2), 31))
+        add(setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортировочный режим", packed(31, 4), 31))
+        add(setting("inmotion_load_detect", "Rider detection", "Датчик присутствия райдера", packed(31, 6), 31))
+        add(setting(KEY_NO_LOAD_DETECT, "No-load detection", "Датчик отсутствия нагрузки", packed(32, 0), 32))
+        add(setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Режим езды при низком заряде", packed(32, 2), 32))
+        add(setting(KEY_QUIET_FAN, "Quiet fan mode", "Тихий режим вентилятора", packed(32, 4), 32))
+        add(setting("inmotion_active_sound", "Active sound", "Активный звук", packed(32, 6), 32))
+        add(setting("inmotion_touch_key", "Touch key", "Сенсорная кнопка", packed(33, 0), 33))
+        add(setting("inmotion_usb_power_switch", "USB power", "Питание USB", packed(33, 2, mask = 0xF), 33))
+        add(setting("inmotion_range_estimate", "Range estimate", "Расчёт запаса хода", packed(33, 6), 33))
+        add(setting("inmotion_assist_balance", "Assist balance", "Балансировка ассистента", packed(34, 0), 34))
+        add(setting("inmotion_acce_feedback", "Acceleration feedback switch", "Переключатель отклика разгона", packed(34, 2), 34))
+        add(setting(KEY_SPEED_LIMIT_UNLOCK, "Speed limit unlocked", "Ограничение скорости снято", packed(34, 4, mask = 0x1), 34))
+        add(setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Компенсация уклона в вираже", packed(34, 5, mask = 0x1), 34))
+    }
+}
+
+/**
+ * `V12sSettings.fromBytes` and `V9Settings.fromBytes` (`lorin/settings/`), relative to the
+ * `getSettingsAll` (`0x20`) payload. Both reject payloads below 42 bytes and parse the same
+ * bytes; they differ only in what bits 17 and 18 of the flag word are called.
+ *
+ * This is the P6 block (see [toP6SettingCapabilities]) without the three output thresholds at
+ * 14..19 and without the tyre, logo, berm and charge bytes after the assist pair - so from
+ * `pitch_zero` on every field sits six bytes earlier, and the flag word is at 38 instead of 45.
+ *
+ * WheelLog disagrees and is wrong here: its `parseSettingsV12S` / `parseSettingsV9` are copies
+ * of the V13 parser, which would put the speed limit at 0 - in its own V12S capture that reads
+ * 0 km/h, while offset 8 reads the 70 km/h the same wheel's realtime frame reports as its
+ * tilt-back speed. The V9 capture tells the same story (45 km/h @8 against 42.29 dynamic).
+ *
+ * Writable, with readback: voice volume (`0x26`), sound (`0x2C`) and auto headlight (`0x2F`),
+ * for the reason given on [toV13FamilySettingCapabilities]. V9's DRL id is `0x44`
+ * (`V9Cmd.daytimeRunningLightSwitchCmd`) against WheelLog's `0x2D`, so it stays display-only.
+ */
+private fun ByteArray.toV12sFamilySettingCapabilities(isV9: Boolean): List<InmotionSettingCapability> {
+    if (size < 42) {
+        return emptyList()
+    }
+    val flags = uint32Le(38)
+    fun flag(bit: Int) = if (flags.bit(bit)) 1 else 0
+    return buildList {
+        add(setting(KEY_SPEED_LIMIT, "Speed limit, km/h", "Ограничение скорости, км/ч", uint16Le(8) / SPEED_SCALE, 8))
+        add(setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Порог предупреждения 1, км/ч", uint16Le(10) / SPEED_SCALE, 10))
+        add(setting(KEY_SPEED_WARNING_2, "Speed warning 2, km/h", "Порог предупреждения 2, км/ч", uint16Le(12) / SPEED_SCALE, 12))
+        add(setting(KEY_PITCH_ZERO, "Pedal angle trim, 0.1°", "Угол педалей, 0.1°", int16Le(14) / PITCH_SCALE, 14))
+        add(setting(KEY_STANDBY_TIME, "Standby timeout, min", "Режим ожидания, мин", uint16Le(16) / STANDBY_SCALE, 16))
+        add(setting("inmotion_driver_mode", "Controller mode", "Режим контроллера", u8(18) and 0xF, 18))
+        add(setting(KEY_RIDE_MODE, "Pedal mode", "Режим педалей", (u8(18) shr 4) and 0xF, 18))
+        add(setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Чувствительность педалей 1", u8(19), 19))
+        add(setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Чувствительность педалей 2", u8(20), 20))
+        add(setting(KEY_VOICE_VOLUME, "Voice volume", "Громкость озвучки", u8(21), 21, SUB_VOLUME, 0, 100, "slider"))
+        add(setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Режим светодиодных эффектов", u8(22), 22))
+        add(setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Порог датчика автосвета (низкий)", u8(23), 23))
+        add(setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Порог датчика автосвета (высокий)", u8(24), 24))
+        add(setting(KEY_LOW_BEAM_BRIGHTNESS, "Low beam brightness", "Яркость ближнего света", u8(25), 25))
+        add(setting(KEY_HIGH_BEAM_BRIGHTNESS, "High beam brightness", "Яркость дальнего света", u8(26), 26))
+        add(setting("inmotion_active_sound_sensitivity", "Active sound sensitivity", "Чувствительность активного звука", u8(27), 27))
+        add(setting("inmotion_high_beam_auto_switch_speed", "High beam auto switch speed, km/h", "Скорость автопереключения дальнего, км/ч", uint16Le(28) / SPEED_SCALE, 28))
+        add(setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Ассист разгона, %", int8(30), 30))
+        add(setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Ассист торможения, %", int8(31), 31))
+        add(setting(KEY_AUDIO_SWITCH, "Sound", "Звук", flag(0), 38, SUB_VOICE_SWITCH, 0, 1, "toggle"))
+        add(setting("inmotion_turn_signal_light", "Turn signal active", "Активен поворотник", flag(1), 38))
+        add(setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Датчик поднятия", flag(2), 38))
+        add(setting(KEY_AUTO_LIGHT_STATE, "Auto headlight", "Автосвет", flag(3), 38, SUB_AUTO_HEADLIGHT, 0, 1, "toggle"))
+        add(setting("inmotion_auto_brightness", "Auto brightness", "Автояркость", flag(4), 38))
+        add(setting(KEY_LOCK_MODE, "Wheel lock", "Замок колеса", flag(5), 38))
+        add(setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортировочный режим", flag(6), 38))
+        add(setting("inmotion_load_detect", "Rider detection", "Датчик присутствия райдера", flag(7), 38))
+        add(setting(KEY_NO_LOAD_DETECT, "No-load detection", "Датчик отсутствия нагрузки", flag(8), 38))
+        add(setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Режим езды при низком заряде", flag(9), 38))
+        add(setting("inmotion_active_sound", "Active sound", "Активный звук", flag(10), 38))
+        add(setting("inmotion_touch_key", "Touch key", "Сенсорная кнопка", flag(11), 38))
+        add(setting("inmotion_usb_power_switch", "USB power", "Питание USB", flag(12), 38))
+        add(setting(KEY_AUTO_CLOSE_SCREEN, "Auto screen off", "Автовыключение экрана", flag(13), 38))
+        add(setting("inmotion_range_estimate", "Range estimate", "Расчёт запаса хода", flag(14), 38))
+        add(setting("inmotion_assist_balance", "Assist balance", "Балансировка ассистента", flag(15), 38))
+        add(setting("inmotion_acce_feedback", "Acceleration feedback switch", "Переключатель отклика разгона", flag(16), 38))
+        if (isV9) {
+            add(setting(KEY_METRIC_UNIT, "Metric units", "Метрические единицы", flag(17), 38))
+            add(setting(KEY_DRL_STATE, "Daytime running lights", "Дневные ходовые огни", flag(18), 38))
+        } else {
+            add(setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Компенсация уклона в вираже", flag(17), 38))
+            add(setting("inmotion_logo_light_status", "Logo light", "Подсветка логотипа", flag(18), 38))
+        }
+        add(setting("inmotion_tbox_low_battery_wakeup", "T-Box low battery wake-up", "Пробуждение T-Box при низком заряде", flag(19), 38))
+        add(setting("inmotion_show_tbox_info", "Show T-Box info", "Показывать данные T-Box", flag(20), 38))
+    }
 }
 
 private fun ByteArray.toV12SettingCapabilities(): List<InmotionSettingCapability> {

@@ -35,7 +35,19 @@ enum class MetricId(
     PITCH_DEG("Тангаж (Pitch)", "Pitch Angle", "°"),
     ROLL_DEG("Крен (Roll)", "Roll Angle", "°"),
     TRIP_DISTANCE_KM("Дистанция поездки", "Trip Distance", "км"),
-    TOTAL_DISTANCE_KM("Общий пробег", "Total Odometer", "км");
+    TOTAL_DISTANCE_KM("Общий пробег", "Total Odometer", "км"),
+
+    /**
+     * Tyre pressure, from the rider's own TPMS sensor rather than from the wheel.
+     *
+     * Like [GPS_SPEED_KMH] this is not the wheel's metric: no brand puts tyre pressure on the
+     * wire, and the sensor is a separate device the rider binds themselves. It belongs here all
+     * the same, because a slow puncture is the one failure a rider cannot feel until the wheel
+     * is already handling differently, and watching the number by eye is exactly what an alert
+     * is for. A consumer feeding only wheel telemetry into the library simply never fills it,
+     * and a condition on it then stays silent.
+     */
+    TIRE_PRESSURE_BAR("Давление в шине", "Tire Pressure", "бар");
 
     fun displayName(isRu: Boolean = true): String = if (isRu) displayNameRu else displayNameEn
 
@@ -43,6 +55,7 @@ enum class MetricId(
         SPEED_KMH, GPS_SPEED_KMH -> if (isRu) "км/ч" else "km/h"
         TRIP_DISTANCE_KM, TOTAL_DISTANCE_KM -> if (isRu) "км" else "km"
         VOLTAGE_V, CELL_VOLTAGE_AVG_V, CELL_VOLTAGE_DELTA_V -> if (isRu) "В" else "V"
+        TIRE_PRESSURE_BAR -> if (isRu) "бар" else "bar"
         CURRENT_A, PHASE_CURRENT_A -> if (isRu) "А" else "A"
         POWER_W -> if (isRu) "Вт" else "W"
         else -> unit

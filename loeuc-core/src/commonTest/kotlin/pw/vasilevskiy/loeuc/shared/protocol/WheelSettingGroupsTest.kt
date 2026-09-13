@@ -2,6 +2,9 @@ package pw.vasilevskiy.loeuc.shared.protocol
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import pw.vasilevskiy.loeuc.shared.api.InmotionLegacySettingKeys
+import pw.vasilevskiy.loeuc.shared.api.toDeviceSettingCapabilities
 import kotlin.test.assertTrue
 
 class WheelSettingGroupsTest {
@@ -32,6 +35,27 @@ class WheelSettingGroupsTest {
     }
 
     @Test
+    fun everyLegacyInmotionSettingLandsInItsSection() {
+        // Real V8F slow info: every one of the eight read-only settings is present.
+        val settings = assertNotNull(
+            InmotionLegacyDecoder.decodeSettings(InmotionLegacyCaptures.message(InmotionLegacyCaptures.v8fSlow)),
+        ).toDeviceSettingCapabilities()
+        assertEquals(InmotionLegacySettingKeys.all.toSet(), settings.map { it.key }.toSet())
+
+        val expected = mapOf(
+            "inmotion_legacy_max_speed" to WheelSettingGroups.Speed,
+            "inmotion_legacy_pedal_hardness" to WheelSettingGroups.Ride,
+            "inmotion_legacy_pedal_tilt" to WheelSettingGroups.Ride,
+            "inmotion_legacy_ride_mode" to WheelSettingGroups.Ride,
+            "inmotion_legacy_headlight" to WheelSettingGroups.Light,
+            "inmotion_legacy_decorative_light" to WheelSettingGroups.Light,
+            "inmotion_legacy_speaker_volume" to WheelSettingGroups.Sound,
+            "inmotion_legacy_handle_button" to WheelSettingGroups.Safety,
+        )
+        assertEquals(expected, settings.associate { it.key to WheelSettingGroups.of(it.key) })
+    }
+
+    @Test
     fun pedalStiffnessLeadsTheRideSectionOnEveryBrand() {
         // LeaperKim used to file it under "Other" - it is a control setting, and the one a
         // rider changes most often, so it belongs at the head of the first section.
@@ -44,6 +68,7 @@ class WheelSettingGroupsTest {
             "inmotion_pedal_sensitivity_1",
             "inmotion_pedal_sensitivity_2",
             "ninebot_pedal_sensitivity",
+            "inmotion_legacy_pedal_hardness",
         )
         assertEquals(pinned.indices.toList(), pinned.map { WheelSettingGroups.pinRank(it) })
         assertTrue(

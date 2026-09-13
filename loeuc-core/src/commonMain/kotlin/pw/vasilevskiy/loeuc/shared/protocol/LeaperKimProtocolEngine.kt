@@ -374,6 +374,44 @@ class LeaperKimProtocolEngine {
     }
 
     /**
+     * A settings-action frame that asks the wheel for nothing at all.
+     *
+     * Both spellings of the app's own `0x16` action packet, with every action slot left at the
+     * `0x80` placeholder. The documented shapes are, pre-CRC:
+     *
+     * ```text
+     * fall protection angle  4C 64 41 70 16 01 00 80 80 80 80 80 80 80 80 80 80 <angle>
+     * shutdown in 10 seconds 4C 64 41 70 16 01 00 80 80 80 80 80 80 80 80 80 01 80
+     * this frame             4C 64 41 70 16 01 00 80 80 80 80 80 80 80 80 80 80 80
+     * ```
+     *
+     * Why it does nothing. `LdApDecodedObjectHandler` takes the `body[1] == 0` branch, reads
+     * `body[11]` and passes it on: only `1` there arms the ten-second shutdown, and `0x80` does
+     * not. `body[12]` goes to the next setter, where `0x80` falls outside its range check. The
+     * remaining slots are placeholders in every documented command of this family. So the wheel
+     * parses the frame, dispatches it, and changes nothing.
+     *
+     * Why it might be audible is a separate question, and one the firmware notes do not answer:
+     * the caller wants the wheel to acknowledge a received command the way Begode does, with a
+     * sound. That is the owner's reading of the dispatcher, not something this repository has
+     * traced to the tone call, and one press on a real wheel settles it either way. Nothing here
+     * depends on the answer - a wheel that stays silent has simply been told nothing.
+     */
+    @ExperimentalWriteApi
+    fun buildNoOpActionCommand(): ByteArray {
+        val placeholders = ByteArray(11) { 0x80.toByte() }
+        val oldCommand = byteArrayOf(
+            'L'.code.toByte(), 'k'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0x16, 0x01,
+        ) + placeholders + byteArrayOf(0x80.toByte())
+        val newCommand = byteArrayOf(
+            'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0x16, 0x01, 0x00,
+        ) + placeholders
+        return oldCommand.withCrc32() + newCommand.withCrc32()
+    }
+
+    /**
      * Whether the headlight can only be switched by the text command, because this wheel's
      * firmware has no binary `0x0D` handler at all.
      *

@@ -39,6 +39,9 @@ object MetricSpeech {
      */
     fun decimals(metric: MetricId): Int = when (metric) {
         MetricId.CELL_VOLTAGE_AVG_V, MetricId.CELL_VOLTAGE_DELTA_V -> 2
+        // A tyre lives inside a couple of tenths of a bar: a whole number would say "two"
+        // from 1.5 to 2.4 and never move while the tyre went down.
+        MetricId.TIRE_PRESSURE_BAR -> 1
         else -> 0
     }
 
@@ -78,6 +81,7 @@ object MetricSpeech {
         MetricId.ROLL_DEG -> "Крен"
         MetricId.TRIP_DISTANCE_KM -> "Пробег"
         MetricId.TOTAL_DISTANCE_KM -> "Общий пробег"
+        MetricId.TIRE_PRESSURE_BAR -> "Давление"
     }
 
     private fun defaultNameEn(metric: MetricId): String = when (metric) {
@@ -99,6 +103,7 @@ object MetricSpeech {
         MetricId.ROLL_DEG -> "Roll"
         MetricId.TRIP_DISTANCE_KM -> "Trip"
         MetricId.TOTAL_DISTANCE_KM -> "Odometer"
+        MetricId.TIRE_PRESSURE_BAR -> "Pressure"
     }
 
     private fun unitWordRu(metric: MetricId): UnitWord = when (metric) {
@@ -118,6 +123,8 @@ object MetricSpeech {
         MetricId.TEMPERATURE_MOTOR_C, MetricId.TEMPERATURE_BATTERY_C,
         MetricId.PITCH_DEG, MetricId.ROLL_DEG ->
             UnitWord("градус", "градуса", "градусов")
+        MetricId.TIRE_PRESSURE_BAR ->
+            UnitWord("бар", "бара", "бар")
     }
 
     private fun unitWordEn(metric: MetricId): UnitWord = when (metric) {
@@ -137,6 +144,8 @@ object MetricSpeech {
         MetricId.TEMPERATURE_MOTOR_C, MetricId.TEMPERATURE_BATTERY_C,
         MetricId.PITCH_DEG, MetricId.ROLL_DEG ->
             UnitWord("degree", "degrees", "degrees")
+        MetricId.TIRE_PRESSURE_BAR ->
+            UnitWord("bar", "bar", "bar")
     }
 
     /**

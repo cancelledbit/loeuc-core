@@ -39,6 +39,12 @@ enum class WheelProtocol(
     Inmotion("inmotion", emptyList(), "InMotion"),
 
     /**
+     * The older InMotion protocol of the V5, V8 and V10 families (and Solowheel Glide 3): CAN
+     * messages over BLE, read-only, and silent until asked - see [WheelSession.nextRequest].
+     */
+    InmotionLegacy("inmotion_legacy", emptyList(), "InMotion V5/V8/V10"),
+
+    /**
      * The id is `leaperkim_lynxs` because that is what Android has been persisting; `leaperkim`
      * is the spelling the dump detector uses for the same protocol.
      */

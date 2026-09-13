@@ -16,7 +16,7 @@ class DeviceProtocolTest {
     @Test
     fun everyPersistedDecoderIdResolves() {
         val persisted = listOf(
-            "begode", "kingsong", "inmotion", "leaperkim_lynxs", "nosfet",
+            "begode", "kingsong", "inmotion", "inmotion_legacy", "leaperkim_lynxs", "nosfet",
             "ninebot_z", "solowheel_xtreme", "hw_charger", "skat_charger",
         )
         val unresolved = persisted.filter { DeviceProtocol.fromId(it) == null }

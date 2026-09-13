@@ -286,6 +286,32 @@ class BegodeProtocolEngineTest {
         assertEquals(7_200.0, telemetry.totalDistanceKm, 0.0001)
     }
 
+    /**
+     * "Off" and "has not said yet" are different answers, and the frame can only say the
+     * first one: a speed of 100 km/h or more means the rider switched tilt-back off. NaN
+     * stays reserved for a wheel that has sent no status frame at all - the settings screen
+     * prints "off" for a zero and "unknown" for a NaN, and a preset captures only the former.
+     */
+    @Test
+    fun aTiltbackSpeedNobodyRidesAtMeansOffRatherThanUnknown() {
+        val engine = BegodeProtocolEngine()
+        // Настройки читает только современный разбор, а он включается кадром опознания:
+        // 100.8 В в поле пакета - поток не наследный.
+        engine.consume(
+            begodeFrame(type = 1, page = 0).apply {
+                putUInt16Be(offset = 6, value = 1_008)
+            },
+        )
+        val status = begodeFrame(type = 4, page = 24).apply {
+            putUInt16Be(offset = 10, value = 100)
+        }
+
+        val telemetry = requireNotNull(engine.consume(status))
+        assertTrue(!telemetry.isLegacy, "кадр должен разобраться современным путём")
+        assertEquals(0.0, telemetry.tiltbackSpeedKmh, 0.0001)
+        assertTrue(BegodeTelemetry().tiltbackSpeedKmh.isNaN())
+    }
+
     @Test
     fun legacyBegodeExposesTheWheelsOwnAlarmFlags() {
         val engine = BegodeProtocolEngine()
@@ -519,6 +545,127 @@ class BegodeProtocolEngineTest {
 
         assertEquals(0.0, telemetry.speedKmh, 0.0001)
         assertTrue(telemetry.power >= 0.0, "a balancing wheel draws, was ${telemetry.power}")
+    }
+
+    /**
+     * A wheel that does not fill `type=7` gets the estimate, not a zero.
+     *
+     * An EX30 sends the frame 1,666 times in a real capture and leaves everything past the
+     * battery current at zero: no motor temperature, no PWM. Published as read, that zero
+     * pins the overload gauge at 0 % for the whole ride, which reads as "no load" right up
+     * to the cutout - and being recognised as a modern wheel had switched off the estimate
+     * every Gotway otherwise runs on.
+     */
+    @Test
+    fun aStubPowerFrameGetsTheEstimateInsteadOfAZero() {
+        val engine = BegodeProtocolEngine()
+        engine.setPackSeriesCells(32)
+        val battery = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 1_335)
+        }
+        // Exactly what the EX30 sends: battery current, and nothing else.
+        val stubPower = begodeFrame(type = 7, page = 24).apply {
+            putInt16Be(offset = 2, value = 57)
+        }
+        val moving = begodeFrame(type = 0, page = 24).apply {
+            putInt16Be(offset = 4, value = 1_000)
+            putInt16Be(offset = 10, value = 2_000)
+        }
+
+        engine.consume(battery)
+        engine.consume(stubPower)
+        val telemetry = requireNotNull(engine.consume(moving))
+
+        assertFalse(telemetry.isLegacy, "колесо остаётся современным")
+        assertTrue(
+            telemetry.motorTemperature.isNaN(),
+            "мотор ровно 0.00 C - это незаполненное поле, а не показание, было ${telemetry.motorTemperature}",
+        )
+        assertTrue(
+            telemetry.pwmPercent > 0.0,
+            "оценка ШИМ должна работать там, где колесо своего не сообщает, было ${telemetry.pwmPercent}",
+        )
+    }
+
+    /** A wheel that does fill the frame keeps its own number; the estimate stays out of it. */
+    @Test
+    fun aRealPowerFrameWinsOverTheEstimate() {
+        val engine = BegodeProtocolEngine()
+        engine.setPackSeriesCells(32)
+        val battery = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 6, value = 1_335)
+        }
+        val power = begodeFrame(type = 7, page = 24).apply {
+            putInt16Be(offset = 2, value = -250)
+            putInt16Be(offset = 6, value = 45)
+            putInt16Be(offset = 8, value = 37)
+        }
+        val moving = begodeFrame(type = 0, page = 24).apply {
+            putInt16Be(offset = 4, value = 1_000)
+            putInt16Be(offset = 10, value = 2_000)
+        }
+
+        engine.consume(battery)
+        engine.consume(power)
+        val telemetry = requireNotNull(engine.consume(moving))
+
+        assertEquals(45.0, telemetry.motorTemperature, 0.0001)
+        assertEquals(37.0, telemetry.pwmPercent, 0.0001)
+    }
+
+    /**
+     * The catalogue sets the estimate's baseline, because it knows the model and the manual
+     * voltage class only exists for wheels whose model is not known.
+     *
+     * The no-load speed is not proportional to the pack class - 102.7 km/h at 100.8 V against
+     * 113.0 at 134.4 - so a 32S wheel left on the 100.8 V default reads about a fifth low,
+     * which is the wrong direction to be wrong in for an overload warning.
+     */
+    @Test
+    fun theCatalogueSetsThePwmEstimateBaseline() {
+        val engine = BegodeProtocolEngine()
+
+        engine.setLegacyVoltageClassMaxVoltage(100.8)
+        assertEquals(102.7 / 100.8, engine.legacyPwmNoLoadRatio(), 0.0001)
+
+        engine.setPackSeriesCells(32)
+        assertEquals(113.0 / 134.4, engine.legacyPwmNoLoadRatio(), 0.0001)
+    }
+
+    /**
+     * The power margin comes back from `type=1 @2`, as the complement of the load level.
+     *
+     * The notes could not decide what this field was - "likely SOC" in one place, "power alarm
+     * threshold" in another. It is not the charge: an EX30 reports 85 while sitting at 133.5 V
+     * of a 134.4 V pack, and a Commander holds 90 unchanged from 0 to 36 km/h. A number that
+     * does not move while the wheel does is a setting, and EUC World reads the same field the
+     * same way - range 50..100, published as `100 - value`.
+     */
+    @Test
+    fun thePowerMarginComesBackFromTheBatteryFrame() {
+        val engine = BegodeProtocolEngine()
+        val battery = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 2, value = 85)
+            putUInt16Be(offset = 6, value = 1_335)
+        }
+
+        val telemetry = requireNotNull(engine.consume(battery))
+
+        assertEquals(15.0, telemetry.powerMarginPercent, 0.0001)
+    }
+
+    /** Outside the window the vendor apps accept, the field is something else - or nothing. */
+    @Test
+    fun aPowerLevelOutsideTheAcceptedWindowIsIgnored() {
+        val engine = BegodeProtocolEngine()
+        val battery = begodeFrame(type = 1, page = 0).apply {
+            putUInt16Be(offset = 2, value = 7)
+            putUInt16Be(offset = 6, value = 1_335)
+        }
+
+        val telemetry = requireNotNull(engine.consume(battery))
+
+        assertTrue(telemetry.powerMarginPercent.isNaN())
     }
 
     private fun begodeFrame(type: Int, page: Int): ByteArray {
