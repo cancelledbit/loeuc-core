@@ -10,7 +10,13 @@ enum class ComparisonOperator(val symbol: String, val displayNameRu: String, val
     LESS_OR_EQUAL("<=", "Меньше или равно", "Less than or equal"),
     EQUALS("==", "Равно", "Equals");
 
-    fun displayName(isRu: Boolean = true): String = if (isRu) displayNameRu else displayNameEn
+    /**
+     * The label in the requested language.
+     *
+     * No default: see [MetricId.displayName]. The language belongs to the consumer, not to the
+     * library, and Kotlin defaults do not reach Swift anyway.
+     */
+    fun displayName(isRu: Boolean): String = if (isRu) displayNameRu else displayNameEn
 
     fun compare(value: Double, threshold: Double): Boolean = when (this) {
         GREATER_THAN -> value > threshold

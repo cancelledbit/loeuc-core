@@ -1,0 +1,6 @@
+# JitPack builds only the extension contract: it is the one artifact third-party Android apps
+# depend on by coordinates. The rest of the library is consumed as source.
+jdk:
+  - openjdk21
+install:
+  - ./gradlew :loeuc-extension-api:publishToMavenLocal

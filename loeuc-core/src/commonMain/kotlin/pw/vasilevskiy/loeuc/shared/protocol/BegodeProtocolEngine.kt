@@ -47,6 +47,17 @@ data class BegodeTelemetry(
      */
     val powerMarginPercent: Double = Double.NaN,
     val cellVoltages: List<Double> = emptyList(),
+    /**
+     * Hottest and coldest battery sensor the wheel reports, from the pack summary at `type=1`.
+     *
+     * `NaN` where the wheel does not measure it: one of the three captures that have this
+     * frame answers a hard `0/0` on every one of them, and a battery claiming 0 C in a room
+     * is the kind of reading an overheat alert is built to act on. The other two report
+     * 22..24 C parked and 29..36 C after a ride, always at or below the controller sensor in
+     * the same frame set, which is what the numbers should do.
+     */
+    val batteryTemperatureMax: Double = Double.NaN,
+    val batteryTemperatureMin: Double = Double.NaN,
     /** Raw alarm bitmask reported by the wheel itself, see [BegodeWheelAlert]. */
     val wheelAlertFlags: Int = 0,
     val lastType: Int = -1,
@@ -62,6 +73,41 @@ data class BegodeTelemetry(
      * tiltback" on) read the same two bits the same way.
      */
     val speedAlarmMode: Int? = null,
+    /**
+     * Side-fall cutoff level `0..2` from `type=4`, `(u16be @6 >> 7) & 7`, in the order of the
+     * `>`, `=`, `<` commands. `null` until seen, or when the field holds anything else.
+     *
+     * This and the rest of the settings read-backs below come from one reading of WheelHUD's
+     * native Begode parser, cross-checked by a second independent reading of the same binary
+     * and against every Begode capture in the repository, where each field holds a constant
+     * in-range value for the whole ride. No capture changes one of them mid-ride, so none is
+     * proven by a change of value yet. See `docs/begode-protocol-notes.md`.
+     */
+    val sideTiltThreshold: Int? = null,
+    /** LED strip mode `0..9` from `type=4 @13 & 0x0F`, the value `W M n` writes. */
+    val ledMode: Int? = null,
+    /**
+     * Side-fall cutoff angle as the wire index `0..9` from the low nibble of `type=7 @5`;
+     * the angle is [BegodeSettingsWriter.MinSideTiltDegrees] plus five degrees per step.
+     */
+    val sideTiltAngleIndex: Int? = null,
+    /** Field weakening `0..9` from the high nibble of `type=7 @5`, the value `W C n` writes. */
+    val fieldWeakening: Int? = null,
+    /**
+     * Pedal dip in turns `0..9`, `(u16be @14 >> 10) & 0x0F` of `type=0`.
+     *
+     * Read only on stock firmware once `type=7` has been seen, as WheelHUD gates it: on legacy
+     * streams and on the custom firmwares `@14` is something else (PWM on `CF` and `BF`).
+     */
+    val pedalDip: Int? = null,
+    /**
+     * Pedal horizontal trim `-4..+5`, `((u16be @14 >> 5) & 0x1F) - 4` of `type=0` - the wire
+     * value `W U n` writes, re-centred the same way [BegodeSettingsWriter.pedalTrim] does.
+     * Same gating as [pedalDip].
+     */
+    val pedalTrim: Int? = null,
+    /** Buzzer volume `1..9` from `type=0 @17 & 0x0F`. Same gating as [pedalDip]. */
+    val buzzerVolume: Int? = null,
     /** SmirnoV firmware only: pedal mode `0..3` from `type=1 @6 & 3`. See [BegodeSmirnovSettings]. */
     val smirnovPedalMode: Int? = null,
     /** SmirnoV firmware only: the trick byte at `type=0 @16`. */
@@ -242,10 +288,21 @@ object BegodeIdentityReplies {
  *
  * Both are read-only one-byte queries: WheelLog asks `V` then `N`, EUC World asks `N` then `V`
  * and refuses to write settings before both have answered, and the official Begode app asks `N`.
- * WheelLog retries every 40 ms for about fifty frames, because a wheel that is busy streaming can
- * miss a single byte. Here the two alternate every [RETRY_INTERVAL_MILLIS], which asks each one
- * every 200 ms, up to [MAX_ATTEMPTS] times; a stock wheel that never answers `V` costs twenty
- * ignored bytes.
+ *
+ * ## Pacing: never while the wheel is silent
+ *
+ * A query costs the rider telemetry. `GotWay_012960` (stock `GW2026304`, captures
+ * `20A71631EF9E/20260915_171748`, `_172124`, `_172235`) finishes the frame set it is in the middle
+ * of and then sends nothing for as long as bytes keep arriving; about one second after the last
+ * one it prints its version line and streams again. It never answered `N`. Asked every 100 ms,
+ * twenty times each, it went silent for five seconds - longer than the phone's connection-lost
+ * watchdog - so every connection ended in a reconnect that asked again.
+ *
+ * So a query goes out only while the stream is alive - a notify within [STREAM_ALIVE_MILLIS] -
+ * and no sooner than [RETRY_INTERVAL_MILLIS] after the previous one, which is longer than that
+ * wheel's pause. A wheel that stops to listen is therefore asked again only after it has
+ * resumed, and each query costs at most one such pause. An answer seen before the session
+ * started counts too ([seed]): that wheel's version line can arrive before the first query.
  *
  * Nothing but `N` and `V` ever comes out of this. Settings writes do not go through it.
  */
@@ -262,6 +319,8 @@ class BegodeIdentityRequests {
     private var lastRequestAtMillis = 0L
     private var hasSentRequest = false
     private var lastSent: Byte? = null
+    private var lastNotifyAtMillis = 0L
+    private var hasHeardWheel = false
 
     /** True once there is nothing more to ask: both answered, or both out of attempts. */
     val isFinished: Boolean
@@ -270,8 +329,10 @@ class BegodeIdentityRequests {
     private val nameDue get() = modelName == null && nameAttempts < MAX_ATTEMPTS
     private val versionDue get() = firmware == null && versionAttempts < MAX_ATTEMPTS
 
-    /** One notification as it arrived. */
-    fun onNotify(chunk: ByteArray) {
+    /** One notification as it arrived, at [nowMillis] on the same clock as [nextRequest]. */
+    fun onNotify(chunk: ByteArray, nowMillis: Long) {
+        lastNotifyAtMillis = nowMillis
+        hasHeardWheel = true
         // Same rule as [BegodeProtocolEngine.consume]: a `NAME:` reply counts only at the start of a
         // notify. Accepting it mid-notify here stopped the queries while the engine, which reads it
         // only at the start, never recorded the name - the model hint stayed missing all session.
@@ -283,10 +344,21 @@ class BegodeIdentityRequests {
         }
     }
 
+    /**
+     * Answers that arrived on this connection before the session started - the engine has already
+     * read them out of the stream. A known answer is not asked for again.
+     */
+    fun seed(modelName: String?, firmware: BegodeFirmware?) {
+        if (this.modelName == null) this.modelName = modelName
+        if (this.firmware == null) this.firmware = firmware
+    }
+
     /** The query to write now, or `null` when nothing is due. Returns a fresh array. */
     fun nextRequest(nowMillis: Long): ByteArray? {
         if (isFinished) return null
         if (hasSentRequest && nowMillis - lastRequestAtMillis < RETRY_INTERVAL_MILLIS) return null
+        // Only into a live stream: see the class comment for what a query into silence costs.
+        if (!hasHeardWheel || nowMillis - lastNotifyAtMillis > STREAM_ALIVE_MILLIS) return null
         // Alternate, so a wheel that never answers one query does not hold up the other.
         val askVersion = versionDue && (!nameDue || lastSent == NameQuery)
         val query = if (askVersion) VersionQuery else NameQuery
@@ -315,6 +387,8 @@ class BegodeIdentityRequests {
         lastRequestAtMillis = 0L
         hasSentRequest = false
         lastSent = null
+        lastNotifyAtMillis = 0L
+        hasHeardWheel = false
     }
 
     companion object {
@@ -323,8 +397,21 @@ class BegodeIdentityRequests {
 
         /** `V`, the firmware-version query. WheelLog and EUC World both send it at connect. */
         const val VersionQuery: Byte = 0x56
-        const val RETRY_INTERVAL_MILLIS: Long = 100L
-        const val MAX_ATTEMPTS: Int = 20
+
+        /**
+         * Least time between two queries. Longer than the pause `GotWay_012960` takes after a
+         * query (its version line came 0.98 s after the last byte, frames 0.25 s after that).
+         */
+        const val RETRY_INTERVAL_MILLIS: Long = 1_500L
+
+        /**
+         * A stream counts as alive while its last notify is at most this old. Begode sends a frame
+         * set at least every ~0.3 s; a wheel that has stopped to listen misses this at once.
+         */
+        const val STREAM_ALIVE_MILLIS: Long = 500L
+
+        /** Per query. Each attempt can cost about a second of telemetry. */
+        const val MAX_ATTEMPTS: Int = 2
     }
 }
 
@@ -334,6 +421,28 @@ class BegodeIdentityRequests {
  * any threshold the app evaluates - [HighPower] in particular is the stock Begode alarm that
  * fires at [BegodeProtocolEngine.WHEEL_HIGH_POWER_ALARM_PWM_FRACTION] of motor PWM.
  */
+data class BegodeBmsCell(
+    val index: Int,
+    val voltage: Double,
+)
+
+data class BegodeBmsBattery(
+    val index: Int,
+    /**
+     * How many cells this pack has, taken from the highest page it has ever filled rather
+     * than from a catalogue: the same frames serve a 32-cell wheel and a 50-cell one, and
+     * the wheel is the only one that knows which it is.
+     */
+    val expectedCellCount: Int,
+    val cells: List<BegodeBmsCell>,
+)
+
+data class BegodeBmsSnapshot(
+    val profileId: String,
+    val modelName: String,
+    val batteries: List<BegodeBmsBattery>,
+)
+
 object BegodeWheelAlert {
     const val HighPower: Int = 1 shl 0
     const val Speed2: Int = 1 shl 1
@@ -375,8 +484,19 @@ class BegodeProtocolEngine {
 
     /** The same rule for the motor temperature, which shares the frame and the firmware gap. */
     private var modernMotorTemperatureFieldAlive = false
+
+    /** And for the battery sensors, which a wheel without a smart BMS never fills. */
+    private var modernBatteryTemperatureFieldAlive = false
     private var maxSeriesCellIndex = -1
     private var modernPackVoltageSeen = false
+
+    /**
+     * Has a `type=7` frame arrived. The settings word at `type=0 @14` and the volume at `@17`
+     * are only read after one has: a wheel that sends `type=7` lays `type=0` out the modern
+     * way, and one that does not puts other things there - an RS C30 without `type=7` reads
+     * volume 12 and a pedal trim pinned to the bottom of the scale.
+     */
+    private var modernStatusFrameSeen = false
     private var decodedModelName: String? = null
 
     /**
@@ -397,6 +517,9 @@ class BegodeProtocolEngine {
     private val noLoadEvidence = ArrayDeque<Double>()
     private var highPowerAlarmActive = false
 
+    // The controller's battery current, pulled onto what the smart BMS measures.
+    private val batteryCurrentCalibration = BegodeBatteryCurrentCalibration()
+
     // Accumulated state to support multi-frame telemetry (Type/Page system)
     private var state = BegodeTelemetry()
 
@@ -406,14 +529,17 @@ class BegodeProtocolEngine {
         modernProtocolSeen = false
         modernPwmFieldAlive = false
         modernMotorTemperatureFieldAlive = false
+        modernBatteryTemperatureFieldAlive = false
         maxSeriesCellIndex = -1
         modernPackVoltageSeen = false
+        modernStatusFrameSeen = false
         decodedModelName = null
         firmwareFamily = null
         catalogueSeriesCells = 0
         learnedNoLoadRatio = null
         noLoadEvidence.clear()
         highPowerAlarmActive = false
+        batteryCurrentCalibration.reset()
         state = BegodeTelemetry()
     }
 
@@ -456,6 +582,37 @@ class BegodeProtocolEngine {
 
     /** Series-cell count the charge scale currently runs on, or `0` while nothing is known. */
     fun seriesCellCount(): Int = catalogueSeriesCells
+
+    /**
+     * Per-pack cell voltages, or null on a wheel whose BMS has said nothing.
+     *
+     * [BegodeTelemetry.cellVoltages] is the same numbers flattened for the battery-percent
+     * curve; this keeps the pack each cell sits in, which is the only way a rider can tell
+     * which half of the battery is the weak one.
+     */
+    fun bmsSnapshot(): BegodeBmsSnapshot? {
+        val batteries = (0 until BMS_PACK_COUNT).mapNotNull { pack ->
+            val base = pack * BMS_PACK_CELL_STRIDE
+            val cells = batteryCells
+                .filterKeys { key -> key in base until base + BMS_PACK_CELL_STRIDE }
+                .map { (key, voltage) -> BegodeBmsCell(index = key - base + 1, voltage = voltage) }
+                .sortedBy(BegodeBmsCell::index)
+            cells.takeIf { it.isNotEmpty() }?.let {
+                BegodeBmsBattery(
+                    index = pack + 1,
+                    expectedCellCount = it.last().index,
+                    cells = it,
+                )
+            }
+        }
+        return batteries.takeIf { it.isNotEmpty() }?.let {
+            BegodeBmsSnapshot(
+                profileId = "begode_smart_bms",
+                modelName = "Begode Smart BMS",
+                batteries = it,
+            )
+        }
+    }
 
     fun modelName(): String? = decodedModelName
 
@@ -547,7 +704,7 @@ class BegodeProtocolEngine {
 
         // Update BMS cells if present (common for modern Begode with Smart BMS)
         if (type in 2..3 && page in 0..7) {
-            val packOffset = if (type == 3) 64 else 0
+            val packOffset = if (type == 3) BMS_PACK_CELL_STRIDE else 0
             val pageOffset = page * 8
             repeat(8) { index ->
                 val voltage = frame.uint16Be(2 + index * 2)
@@ -657,6 +814,7 @@ class BegodeProtocolEngine {
                     tripDistanceMeters = frame.uint16Be(8).toDouble(),
                     isLegacy = false,
                 )
+                next = next.withLiveFrameSettings(frame, volumeInFrame = true)
                 // A modern wheel whose own PWM channel never says anything still gets the
                 // estimate - the same one every Gotway has always run on, and the same one
                 // this engine uses for legacy wheels. Being recognised as modern must not
@@ -679,31 +837,19 @@ class BegodeProtocolEngine {
                 }
             }
             4 -> if (page == 24) {
-                val tiltback = frame.uint16Be(10)
-                next = next.copy(
+                next = next.withStatusFrameSettings(frame).copy(
                     totalDistanceKm = frame.totalDistanceKm(),
-                    rideMode = ((frame.uint16Be(6) ushr 13) and 0x7).toDouble(),
-                    // The wheel says "no tilt-back" by reporting a speed nobody rides at. That
-                    // becomes a zero rather than a NaN: NaN is reserved for "the wheel has not
-                    // said yet", and collapsing the two let the settings screen print "off" for
-                    // a wheel that had said nothing - and let a preset captured in that window
-                    // write the off byte to a wheel whose tilt-back was armed.
-                    tiltbackSpeedKmh = if (tiltback >= TILTBACK_UNSET_KMH) {
-                        0.0
-                    } else {
-                        tiltback.toDouble()
-                    },
-                    autoPowerOffSeconds = frame.uint16Be(8).toDouble(),
-                    usesMiles = frame.u8(7) and 0x1 != 0,
                     lightMode = frame.u8(15),
                     wheelAlertFlags = frame.u8(14),
-                    speedAlarmMode = frame.speedAlarmMode(),
                     isLegacy = false,
                 )
             }
             1 -> {
                 val voltage = frame.uint16Be(6) / 10.0
                 modernPackVoltageSeen = true
+                // The BMS's own pack current, tenths of an ampere, one page per half of a BMS.
+                // Signed its own way per wheel; see [BegodeBatteryCurrentCalibration].
+                batteryCurrentCalibration.onBmsCurrent(page, frame.int16Be(8) / 10.0)
                 next = next.copy(
                     voltage = voltage,
                     batteryPercent = calculateBatteryPercent(voltage, batteryCells.values.toList(), isLegacy = false),
@@ -721,6 +867,21 @@ class BegodeProtocolEngine {
                 if (level in MIN_POWER_LEVEL..MAX_POWER_LEVEL) {
                     next = next.copy(powerMarginPercent = (100 - level).toDouble())
                 }
+                // Pack temperatures, whole degrees, as the official app reads them. The pair is
+                // the battery's own extremes and not one pack's: every page of this frame
+                // carries the same two numbers on both wheels that report them, so attributing
+                // them to the page's pack would be inventing a link the wire does not make.
+                val maxTemperature = frame.int16Be(10)
+                val minTemperature = frame.int16Be(12)
+                if (maxTemperature != 0 || minTemperature != 0) {
+                    modernBatteryTemperatureFieldAlive = true
+                }
+                if (modernBatteryTemperatureFieldAlive && maxTemperature >= minTemperature) {
+                    next = next.copy(
+                        batteryTemperatureMax = maxTemperature.toDouble(),
+                        batteryTemperatureMin = minTemperature.toDouble(),
+                    )
+                }
             }
             2, 3 -> {
                 val cells = batteryCells.values.sorted()
@@ -737,12 +898,19 @@ class BegodeProtocolEngine {
                 )
             }
             7 -> if (page == 24) {
-                val current = frame.int16Be(2) / 100.0
+                modernStatusFrameSeen = true
+                val current = batteryCurrentCalibration.correct(frame.batteryCurrentAmps())
                 val voltage = if (next.voltage.isNaN()) 100.0 else next.voltage
+                // `@5` is two settings, one per nibble - the pair the notes long listed as
+                // "unidentified": field weakening above, the side-fall angle index below.
+                val angleAndWeakening = frame.u8(5)
                 next = next.copy(
                     current = current,
                     power = voltage * current,
-                    apparentPower = voltage * current,
+                    // Apparent power is a magnitude by definition, so it keeps no sign.
+                    apparentPower = voltage * abs(current),
+                    fieldWeakening = (angleAndWeakening ushr 4).takeIf { it <= 9 },
+                    sideTiltAngleIndex = (angleAndWeakening and 0xF).takeIf { it <= 9 },
                     isLegacy = false,
                 )
                 // Battery current sits at @2 on every wheel seen so far; everything past it is
@@ -790,20 +958,23 @@ class BegodeProtocolEngine {
         val pwm = hardwarePwm ?: calculateLegacyPwmPercent(speedKmh, voltage, phaseCurrent)
         val flow = powerFlowSign(phaseCurrentRaw, speedRaw, TorqueSignConvention.AgreementIsDriving)
         val measuredCurrent = if (smirnov && frame.u8(7) and 0x1 != 0) frame.int16Be(8) / 100.0 else null
+        val power = measuredCurrent?.let { voltage * it } ?: (flow * voltage * phaseCurrent * (pwm / 100.0))
         val temperature = if (smirnov) {
             frame.int16Be(12) / MPU6500_TEMPERATURE_SENSITIVITY + MPU6500_TEMPERATURE_OFFSET
         } else {
             frame.int16Be(12) / 340.0 + 36.53
         }
-        return state.copy(
+        // `@17` is the volume only while the pack voltage came from `@2`; otherwise it is the
+        // low byte of the voltage this frame was read from.
+        return state.withLiveFrameSettings(frame, volumeInFrame = baseVoltage in 45.0..70.0).copy(
             speedKmh = speedKmh,
             pwmPercent = pwm,
             voltage = voltage,
             current = measuredCurrent ?: (flow * phaseCurrent * (pwm / 100.0)), // Estimated battery current
             phaseCurrent = phaseCurrent,
-            power = measuredCurrent?.let { voltage * it } ?: (flow * voltage * phaseCurrent * (pwm / 100.0)),
-            // Apparent power is a magnitude by definition, so it keeps no sign.
-            apparentPower = measuredCurrent?.let { voltage * abs(it) } ?: (voltage * phaseCurrent * (pwm / 100.0)),
+            power = power,
+            // Legacy wheels expose an estimate: keep its drive/regeneration direction in VA too.
+            apparentPower = power,
             temperature = temperature,
             smirnovTrick = if (smirnov) frame.u8(16) else state.smirnovTrick,
             batteryPercent = calculateBatteryPercent(voltage, emptyList(), isLegacy = true),
@@ -825,15 +996,57 @@ class BegodeProtocolEngine {
         // like it does on modern ones. @8 is the auto-power-off countdown in seconds (it idles at
         // 7200 = two hours and ticks down while the wheel stands still) and @10 is the tiltback
         // speed - neither is distance or charge, though both used to be read as such here.
+        //
+        // The settings in it are read here too, as on a modern stream. A wheel is "legacy" here
+        // by the shape of its voltage field, not by its age: a RACE that sends `type=7` but no
+        // `type=1` lands in this branch, and its settings screen stayed blank for it.
         val alertFlags = frame.u8(14)
         calibrateFromHighPowerAlarm(alertFlags and BegodeWheelAlert.HighPower != 0)
-        return state.copy(
+        return state.withStatusFrameSettings(frame).copy(
             totalDistanceKm = frame.totalDistanceKm(),
             wheelAlertFlags = alertFlags,
-            speedAlarmMode = frame.speedAlarmMode(),
             lastType = frame.u8(18),
             lastPage = frame.u8(19),
             isLegacy = true,
+        )
+    }
+
+    /**
+     * The settings `type=4 page=24` carries, on modern and legacy streams alike.
+     *
+     * The wheel says "no tilt-back" by reporting a speed nobody rides at. That becomes a zero
+     * rather than a NaN: NaN is reserved for "the wheel has not said yet", and collapsing the
+     * two let the settings screen print "off" for a wheel that had said nothing - and let a
+     * preset captured in that window write the off byte to a wheel whose tilt-back was armed.
+     */
+    private fun BegodeTelemetry.withStatusFrameSettings(frame: ByteArray): BegodeTelemetry {
+        val tiltback = frame.uint16Be(10)
+        val modeWord = frame.uint16Be(6)
+        return copy(
+            rideMode = ((modeWord ushr 13) and 0x7).toDouble(),
+            tiltbackSpeedKmh = if (tiltback >= TILTBACK_UNSET_KMH) 0.0 else tiltback.toDouble(),
+            autoPowerOffSeconds = frame.uint16Be(8).toDouble(),
+            usesMiles = frame.u8(7) and 0x1 != 0,
+            speedAlarmMode = frame.speedAlarmMode(),
+            sideTiltThreshold = ((modeWord ushr 7) and 0x7).takeIf { it <= 2 },
+            ledMode = (frame.u8(13) and 0xF).takeIf { it <= 9 },
+        )
+    }
+
+    /**
+     * The settings `type=0` carries: pedal dip and trim in the word at `@14`, the buzzer volume
+     * in the low nibble of `@17`.
+     *
+     * Only on stock firmware once `type=7` has been seen - see [modernStatusFrameSeen]. Until
+     * then the fields stay as they were, which on a fresh connection is unknown.
+     */
+    private fun BegodeTelemetry.withLiveFrameSettings(frame: ByteArray, volumeInFrame: Boolean): BegodeTelemetry {
+        if (!modernStatusFrameSeen || firmwareFamily?.reportsHardwarePwm == true) return this
+        val settingsWord = frame.uint16Be(14)
+        return copy(
+            pedalDip = ((settingsWord ushr 10) and 0xF).takeIf { it <= 9 },
+            pedalTrim = ((settingsWord ushr 5) and 0x1F).takeIf { it <= 9 }?.minus(PEDAL_TRIM_WIRE_CENTRE),
+            buzzerVolume = if (volumeInFrame) (frame.u8(17) and 0xF).takeIf { it in 1..9 } else buzzerVolume,
         )
     }
 
@@ -1059,6 +1272,40 @@ class BegodeProtocolEngine {
     }
 
     /**
+     * Battery current, amperes, from `type=7 @2`: positive while the pack drives the motor,
+     * negative while braking returns energy to it.
+     *
+     * The wire counts the other way round - a draw is a negative word - so the sign is flipped
+     * here, once, and every consumer downstream (battery power, the consumption integral, the
+     * current alert) can read a positive number as "the pack is being spent".
+     *
+     * Unlike the phase current at `type=0 @10` this is a DC-bus quantity, and its sign does not
+     * follow the direction of travel; it needs no [powerFlowSign] against the speed word. On
+     * capture `385CFBC9BF07/20260727_084903` (Begode Master, stock firmware) every moving sample
+     * reads a negative speed, so direction alone cannot tell the two readings apart there - but
+     * acceleration can, binning the moving samples:
+     *
+     *     acceleration        mean @2     @2 negative
+     *     over +3 km/h/s      -10.03 A    100 %
+     *     +1..+3               -6.08 A     96 %
+     *     cruise               -3.38 A     91 %
+     *     -3..-1               -0.76 A     57 %
+     *     under -3 km/h/s      +1.73 A     20 %
+     *
+     * Taken as read, that ride integrates to -116.6 Wh while the pack sags from 122.2 V to
+     * 118.7 V under load. The phase current, whose convention was established independently
+     * ([TorqueSignConvention.AgreementIsDriving]), says the same sample by sample: of 1,771
+     * moving samples it calls driving above 10 A, all 1,771 read `@2` negative, and of 295 it
+     * calls braking, 98 % read it positive. The strongest single draw, -22.83 A at 26 km/h, is
+     * one of the first; the strongest return, +7.53 A at 30 km/h, one of the second. An Extreme Bull Commander GT Pro keeps `@2`
+     * negative (-1.9..-4.8 A) in all four moving samples of its capture, creeping forwards and
+     * backwards alike, which a direction-signed field would not do. WheelLog's `GotwayAdapter`
+     * negates this field unconditionally, outside its per-wheel direction setting, and the
+     * official app shows its absolute value.
+     */
+    private fun ByteArray.batteryCurrentAmps(): Double = -int16Be(2) / 100.0
+
+    /**
      * Motor PWM, percent, from `type=0 @14` - only on firmware that puts it there. Tenths of a
      * percent on the wire: WheelLog scales it `* 10` into its hundredths-of-a-percent output,
      * and EUC World's CF branch reads the same field as `100 - |@14| * 0.1`. On stock firmware
@@ -1104,6 +1351,17 @@ class BegodeProtocolEngine {
          * this is the same reading WheelLog's `GotwayAdapter` takes of the field.
          */
         private const val TILTBACK_UNSET_KMH = 100
+
+        /**
+         * The wire's pedal-trim zero, the same `4` [BegodeSettingsWriter.PedalTrimCentre] adds
+         * on the way out. Repeated rather than referenced so reading a setting does not need
+         * the write API.
+         */
+        private const val PEDAL_TRIM_WIRE_CENTRE = 4
+
+        /** Two packs, and the cell keys of the second start one stride above the first. */
+        private const val BMS_PACK_COUNT = 2
+        private const val BMS_PACK_CELL_STRIDE = 64
 
         // The window the vendor apps accept for the power level, and the window the write
         // command can produce. Outside it the field is something else, or nothing.

@@ -65,6 +65,25 @@ class AlertEngine @JvmOverloads constructor(
 
     private val announcementArbiter = AnnouncementArbiter()
 
+    // Voices requested from outside the rule set, see [setExternalCandidates]. Replaced from
+    // another thread than the one processing telemetry, hence volatile.
+    @kotlin.concurrent.Volatile
+    private var externalCandidates: List<VoiceCandidate> = emptyList()
+
+    /**
+     * Voices that want the speaker for reasons the engine's own rules do not know about, such
+     * as an alert raised by a phone-side extension. They contend for the one slot through the
+     * same [AlertVoiceArbiter] on every [processTelemetry] call until replaced; an empty list
+     * withdraws them.
+     *
+     * A method rather than a constructor parameter for the reason given at
+     * [announcementPublisher]. The caller chooses the priority; giving these a lower one than
+     * any rule (a higher number, see [EXTERNAL_PRIORITY]) keeps the rider's own alerts first.
+     */
+    fun setExternalCandidates(candidates: List<VoiceCandidate>) {
+        externalCandidates = candidates.toList()
+    }
+
     private val alerts = mutableListOf<Alert>()
 
     // Condition tracking state, keyed "alertId:conditionId" -> ConditionStateHistory. The key
@@ -172,6 +191,8 @@ class AlertEngine @JvmOverloads constructor(
                 println("AlertEngine: skipped alert ${alert.id}: ${t.stackTraceToString()}")
             }
         }
+
+        voiceCandidates.addAll(externalCandidates)
 
         // The voice is a level: it is published on every frame, null included.
         val activeVoice = arbiter.select(voiceCandidates, nowMs)
@@ -360,7 +381,11 @@ class AlertEngine @JvmOverloads constructor(
             // failure on Kotlin/Native this file already carries a warning about. The rule
             // itself was also stated from the wrong end ("everything except OneShot"), which
             // would have handed the slot to a spoken alert and made it beep.
-            val voice = decision.voice
+            //
+            // A silent pattern (see SoundPattern.isSilent) takes no voice at all. Its alert
+            // still applies and reverts its commands above; it just has nothing to play, and
+            // holding the slot would silence a neighbour for nothing.
+            val voice = decision.voice?.takeUnless { alert.soundPattern.isSilent }
             if (decision.ownsVoice && voice != null) {
                 voiceCandidates.add(VoiceCandidate(voice, alert.priority))
             }
@@ -488,6 +513,12 @@ class AlertEngine @JvmOverloads constructor(
     }
 
     companion object {
+        /**
+         * Priority for [setExternalCandidates] that yields to every rule: rule priorities are
+         * small numbers where 0 is the most critical, and the arbiter prefers the lowest.
+         */
+        const val EXTERNAL_PRIORITY = 1_000
+
         /**
          * Whether an alert applies to the connected wheel, matched by name or by address.
          */

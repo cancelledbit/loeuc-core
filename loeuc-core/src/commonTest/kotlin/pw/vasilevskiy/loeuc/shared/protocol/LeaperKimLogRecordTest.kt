@@ -43,6 +43,60 @@ class LeaperKimLogRecordTest {
         return out.toByteArray()
     }
 
+    /** A page-32 frame: three records of eleven bytes from offset 48, index at 47. */
+    private fun page32Frame(firstIndex: Int): ByteArray {
+        val out = ArrayList<Byte>()
+        out.add(0xDC.toByte()); out.add(0x5A); out.add(0x5C); out.add(0)
+        repeat(42) { out.add(0x11) }
+        out.add(32)
+        out.add(firstIndex.toByte())
+        for (slot in 0 until 3) {
+            out.add(0x01); out.add((0x10 + slot).toByte())
+            // 0x68CFE840 = 1758455872, a September 2025 date, big-endian seconds.
+            out.add(0x68); out.add(0xCF.toByte()); out.add(0xE8.toByte()); out.add(0x40)
+            repeat(5) { extra -> out.add((slot * 10 + extra - 2).toByte()) }
+        }
+        repeat(4) { out.add(0x77) }
+        return out.toByteArray()
+    }
+
+    @Test
+    fun `parses the three records of a page-32 frame`() {
+        val records = parseLeaperKimLogPage32Records(page32Frame(firstIndex = 10))
+        assertEquals(listOf(10, 11, 12), records.map { it.index })
+        assertEquals(listOf(0x0110, 0x0111, 0x0112), records.map { it.code })
+        assertEquals(listOf(-2L, -1L, 0L, 1L, 2L), records.first().values)
+        assertEquals(0x68CFE840L, records.first().unixSeconds)
+        assertTrue(records.none { it.isEndMarker })
+    }
+
+    @Test
+    fun `page-32 index 255 is the end marker and carries no second record`() {
+        val records = parseLeaperKimLogPage32Records(page32Frame(firstIndex = 255))
+        assertEquals(listOf(255), records.map { it.index })
+        assertTrue(records.single().isEndMarker)
+    }
+
+    @Test
+    fun `page-33 index 4095 is the end marker`() {
+        val record = checkNotNull(parseLeaperKimLogRecord(logFrame(index = 4095)))
+        assertTrue(record.isEndMarker)
+        assertTrue(!checkNotNull(parseLeaperKimLogRecord(logFrame(index = 7))).isEndMarker)
+    }
+
+    @Test
+    fun `page-33 parser ignores page 32 and the page-32 parser ignores page 33`() {
+        assertNull(parseLeaperKimLogRecord(page32Frame(firstIndex = 1)))
+        assertEquals(emptyList(), parseLeaperKimLogPage32Records(logFrame()))
+    }
+
+    @Test
+    fun `time bytes are big-endian unix seconds and zero means no clock`() {
+        val record = checkNotNull(parseLeaperKimLogRecord(logFrame()))
+        assertEquals(0x01020304L, record.unixSeconds)
+        assertNull(record.copy(timeBytes = listOf(0, 0, 0, 0)).unixSeconds)
+    }
+
     @Test
     fun `parses a full log record`() {
         val record = parseLeaperKimLogRecord(logFrame())

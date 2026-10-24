@@ -6,6 +6,13 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNull
 
 class BegodeTelemetryMappingTest {
+    @Test
+    fun regenerationKeepsBothPowerSignsInNeutralTelemetry() {
+        val telemetry = BegodeTelemetry(power = -250.0, apparentPower = -250.0).toDeviceTelemetry()
+        assertEquals(-250.0, telemetry[DeviceMetric.PowerW])
+        assertEquals(-250.0, telemetry[DeviceMetric.ApparentPowerVa])
+    }
+
 
     /**
      * Begode reports the trip in metres and the odometer in kilometres - two neighbouring

@@ -28,8 +28,8 @@ class BegodeSettingsWriterTest {
         assertEquals("WB5", ascii(steps))
         assertTrue(
             steps.all { it.pauseAfterMillis > 0 },
-            "пауза нужна после каждого байта, последний включительно: тишина после команды — " +
-                "единственное, что отделяет её от следующей",
+            "every byte needs a pause after it, the last one included: the silence after a command is " +
+                "the only thing separating it from the next",
         )
     }
 
@@ -128,7 +128,7 @@ class BegodeSettingsWriterTest {
 
         everything.forEach { step ->
             val symbol = step.byte.toInt().toChar()
-            assertTrue(symbol !in forbidden, "команда собрала запретный байт «$symbol»")
+            assertTrue(symbol !in forbidden, "a command assembled the forbidden byte '$symbol'")
         }
     }
 }
@@ -153,7 +153,7 @@ class BegodeSettingsCatalogTest {
             val group = WheelSettingGroups.of(capability.key)
             assertTrue(
                 group != WheelSettingGroups.Other && group != WheelSettingGroups.Raw,
-                "«${capability.key}» осталась без раздела и упала в «${group.titleRu}»",
+                "'${capability.key}' was left without a section and fell into '${group.titleRu}'",
             )
         }
     }
@@ -164,15 +164,15 @@ class BegodeSettingsCatalogTest {
         BegodeSettingsCatalog.capabilities(reportingWheel).forEach { capability ->
             val steps = BegodeSettingsCatalog.writeSteps(capability.key, capability.minValue)
             if (capability.commandId == null) {
-                assertTrue(steps == null, "«${capability.key}» только на чтение, а байты нашлись")
+                assertTrue(steps == null, "'${capability.key}' is read-only, yet bytes were produced")
             } else {
-                assertTrue(steps != null, "«${capability.key}» пишется, а байтов для неё нет")
+                assertTrue(steps != null, "'${capability.key}' is writable, yet there are no bytes for it")
             }
         }
     }
 
     /**
-     * The four settings the wheel reports come back with a value; the rest stay empty.
+     * The settings the wheel has reported come back with a value; the rest stay empty.
      *
      * Empty is the honest answer, not a gap: Begode confirms nothing it is told, and filling
      * these with the last value written would show the rider their own intent dressed up as
@@ -188,6 +188,49 @@ class BegodeSettingsCatalogTest {
         assertEquals(1, byKey[BegodeSettingsCatalog.RideModeKey]?.rawValue)
         assertEquals(null, byKey[BegodeSettingsCatalog.FieldWeakeningKey]?.rawValue)
         assertEquals(null, byKey[BegodeSettingsCatalog.BuzzerVolumeKey]?.rawValue)
+        assertEquals(null, byKey[BegodeSettingsCatalog.PowerMarginTiltbackKey]?.rawValue)
+    }
+
+    /** Each read-back lands on its row in the row's own units. */
+    @Test
+    fun theReadBackSettingsFillTheirRows() {
+        val wheel = BegodeTelemetry(
+            sideTiltThreshold = 2,
+            sideTiltAngleIndex = 3,
+            fieldWeakening = 6,
+            pedalDip = 4,
+            pedalTrim = -2,
+            buzzerVolume = 9,
+            ledMode = 1,
+            speedAlarmMode = 0,
+        )
+        val byKey = BegodeSettingsCatalog.capabilities(wheel).associateBy { it.key }
+
+        assertEquals(2, byKey[BegodeSettingsCatalog.SideTiltThresholdKey]?.rawValue)
+        assertEquals(60, byKey[BegodeSettingsCatalog.SideTiltAngleKey]?.rawValue, "45 + 3 * 5 degrees")
+        assertEquals(6, byKey[BegodeSettingsCatalog.FieldWeakeningKey]?.rawValue)
+        assertEquals(4, byKey[BegodeSettingsCatalog.PedalDipKey]?.rawValue)
+        assertEquals(-2, byKey[BegodeSettingsCatalog.PedalTrimKey]?.rawValue)
+        assertEquals(9, byKey[BegodeSettingsCatalog.BuzzerVolumeKey]?.rawValue)
+        assertEquals(1, byKey[BegodeSettingsCatalog.LedModeKey]?.rawValue)
+        assertEquals(1, byKey[BegodeSettingsCatalog.SpeedAlarmsKey]?.rawValue, "wire 0 is `o`, the switch on")
+    }
+
+    /**
+     * A reading the row cannot write back stays unknown.
+     *
+     * A profile captures what the row shows and applies it later. Field weakening `0` shown on
+     * a `1..9` slider would be captured as `0` and written as `1`; alarm mode `2` is the `i`
+     * letter this catalogue does not send at all.
+     */
+    @Test
+    fun aReadingTheRowCannotWriteBackIsNotShown() {
+        val wheel = BegodeTelemetry(fieldWeakening = 0, pedalTrim = 5, speedAlarmMode = 2)
+        val byKey = BegodeSettingsCatalog.capabilities(wheel).associateBy { it.key }
+
+        assertNull(byKey[BegodeSettingsCatalog.FieldWeakeningKey]?.rawValue)
+        assertNull(byKey[BegodeSettingsCatalog.PedalTrimKey]?.rawValue)
+        assertNull(byKey[BegodeSettingsCatalog.SpeedAlarmsKey]?.rawValue)
     }
 
     /**
@@ -204,7 +247,7 @@ class BegodeSettingsCatalogTest {
         BegodeSettingsCatalog.capabilities(reportingWheel).forEach { capability ->
             assertTrue(
                 capability.kind in allowed,
-                "«${capability.key}» объявила вид «${capability.kind}», которого экраны не знают",
+                "'${capability.key}' declared the kind '${capability.kind}', which the screens do not know",
             )
         }
     }
@@ -227,7 +270,7 @@ class BegodeSettingsCatalogTest {
      */
     @Test
     fun theFirstAlarmSwitchIsNotInverted() {
-        // Первым идёт сам переключатель, вторым — писк-квитанция; см.
+        // The switch itself comes first, the acknowledging beep second; see
         // everySettingWriteEndsWithTheBeepThatTellsTheRiderItLanded.
         fun letter(value: Int) = BegodeSettingsCatalog
             .writeSteps(BegodeSettingsCatalog.SpeedAlarmsKey, value)!!
@@ -241,7 +284,7 @@ class BegodeSettingsCatalogTest {
      * A wheel that has told us nothing yet reports no tilt-back rather than a made-up one.
      *
      * "Off" and "has not said yet" must not be the same value. They were, and it cost twice:
-     * the card printed "В колесе: Выключен" for a wheel that had sent no `type=4 page=24`
+     * the card printed "On the wheel: Off" for a wheel that had sent no `type=4 page=24`
      * frame at all, and `capturePresetSettings` took that for a reading - so a profile
      * captured in the first seconds of a connection switched the rider's tilt-back off when
      * it was applied.
@@ -354,13 +397,13 @@ class BegodeSettingsCatalogTest {
 
         for (key in keys) {
             val steps = BegodeSettingsCatalog.writeSteps(key, 1)
-            assertTrue(steps != null && steps.isNotEmpty(), "$key: не пишется вовсе")
+            assertTrue(steps != null && steps.isNotEmpty(), "$key: does not write at all")
             assertEquals(
                 'b'.code.toByte(),
                 steps!!.last().byte,
-                "$key: последним байтом не писк",
+                "$key: the last byte is not the beep",
             )
-            assertTrue(steps.size >= 2, "$key: писк есть, а самой команды нет")
+            assertTrue(steps.size >= 2, "$key: the beep is there, the command itself is not")
         }
     }
 
@@ -389,7 +432,7 @@ class BegodeSettingsCatalogTest {
         for ((key, steps) in sequences) {
             assertTrue(
                 steps.all { it.pauseAfterMillis > 0 },
-                "$key: пауза нулевая — ${steps.map { it.pauseAfterMillis }}",
+                "$key: a zero-length pause - ${steps.map { it.pauseAfterMillis }}",
             )
         }
     }
@@ -409,5 +452,17 @@ class BegodeSettingsCatalogTest {
     @Test
     fun theHornAndTheReceiptAreTheSameByte() {
         assertEquals('b'.code.toByte(), BegodeSettingsWriter.beep().single().byte)
+    }
+
+    /**
+     * The one-frame horn is exactly the beep byte, alone - what the app's horn button built
+     * out of [BegodeSettingsWriter.beep] before the frame form existed.
+     */
+    @Test
+    fun theHornFrameIsTheBeepByteAlone() {
+        val horn = BegodeSettingsWriter.horn()
+
+        assertEquals(listOf(0x62.toByte()), horn.toList())
+        assertEquals(BegodeSettingsWriter.beep().map { it.byte }, horn.toList())
     }
 }

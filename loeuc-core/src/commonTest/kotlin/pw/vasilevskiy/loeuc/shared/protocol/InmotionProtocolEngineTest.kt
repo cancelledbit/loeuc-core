@@ -49,7 +49,8 @@ class InmotionProtocolEngineTest {
             putInt16Le(16, 150)
             putInt16Le(18, 100)
             putInt16Le(20, -50)
-            putInt16Le(26, 123)
+            // The trip counter is `@24` - a real V11 ride settled it, see InmotionTotalStatsTest.
+            putInt16Le(24, 123)
             putInt16Le(28, 6_550)
             putInt16Le(30, 2_500)
             putInt16Le(34, 5_000)
@@ -604,6 +605,59 @@ class InmotionProtocolEngineTest {
     }
 
     /**
+     * Motor temperature on a P6 ridden hard (`loeuc_E17CC2C97F8B_unknown_20260916_221556.jsonl`,
+     * 2807 realtime frames). Byte 59 walks 219 -> 255 -> 0 -> 67 without a break in the ride,
+     * which is only continuous if the byte is signed and biased by +80: 43 C climbing to 147 C.
+     * Read unsigned, the same walk reads 43 C, 79 C, then -176 C - the rider saw a ceiling of
+     * 79 and a -175, and the real motor was around 140.
+     *
+     * The three frames below are taken verbatim from that capture, at the bottom of the climb,
+     * at the wrap, and at the peak.
+     */
+    @Test
+    fun decodesP6MotorTemperatureAboveEightyDegrees() {
+        fun engine(): InmotionProtocolEngine = InmotionProtocolEngine().apply {
+            consume("AAAA11088201020D0101010094".bytes())
+        }
+
+        val climbing = (
+            "AAAA145784D259F8FF000000003A000000B601C50100000000330167022C0100000000" +
+                "DC007601F622D522983A983A983A1027401FE02EE02E50C300000000CEDB00D0B0CFDE" +
+                "DDB03A000400000000490002000000000000000000D5"
+            ).bytes()
+        val atEighty = (
+            "AAAA1457840853B4150000000071260000EE1FA817212E0523B401DA002C0100005901" +
+                "EE003F1B6C203720983A983A983A1027401FE02EE02E50C300000000D00000E0B0DBDD" +
+                "DDB00E00040000000049000200000000000000000075"
+            ).bytes()
+        val peak = (
+            "AAAA145784234D1E12000000007C2600004B181118C623AC1A950192FF2C010000AB06" +
+                "EB00BB1424138612983A983A983A1027401FE02EE02EC8AF00000000CE4300E7B0E4E7" +
+                "E0B02100040000000049000200000000000000000022"
+            ).bytes()
+
+        val cold = assertNotNull(engine().consume(climbing)?.telemetry)
+        assertEquals(43.0, cold.motorTemperature, 0.01)
+        assertEquals(30.0, cold.mosTemperature, 0.01)
+        assertEquals(32.0, cold.boardTemperature, 0.01)
+
+        val hot = assertNotNull(engine().consume(peak)?.telemetry)
+        assertEquals(147.0, hot.motorTemperature, 0.01)
+        assertEquals(30.0, hot.mosTemperature, 0.01)
+        assertEquals(55.0, hot.boardTemperature, 0.01)
+
+        // Raw zero is exactly 80 C here, not an absent sensor: the capture holds seven
+        // consecutive frames of it in the middle of the climb, between 79 C and 95 C. Blanking
+        // them is what took the reading off the rider's dashboard for three and a half seconds.
+        val eighty = assertNotNull(engine().consume(atEighty)?.telemetry)
+        assertEquals(80.0, eighty.motorTemperature, 0.01)
+
+        // The slots this wheel does not populate still read as absent, and byte 60 is a hard
+        // zero in all 2807 frames of the capture.
+        assertTrue(eighty.batteryTemperature.isNaN())
+    }
+
+    /**
      * A P6 charging at 232.4 V read out as 23.24 V while `bus_voltage` two fields earlier
      * was right, so `charge_voltage` is tenths of a volt. No capture holds a non-zero
      * value for it yet - the scale rests on that reading plus the fact that a 232 V pack
@@ -661,7 +715,7 @@ class InmotionProtocolEngineTest {
         val active = diagnostics.decodedItems.single { it.isActive }
         assertEquals(10, active.index)
         assertEquals("MOS temperature sensor fault", active.titleEn)
-        assertEquals("Ошибка датчика температуры MOS", active.titleRu)
+        assertEquals("Ошибка датчика температуры мосфетов", active.titleRu)
 
         assertNotNull(bms)
         assertEquals("inmotion_p6", bms.profileId)
@@ -993,9 +1047,7 @@ class InmotionProtocolEngineTest {
         assertNull(engine.buildSettingCommand("inmotion_berm_angle", 91))
         // Fields whose command id is ambiguous in the setter table, and the ones that can
         // cut motor power, are still display-only.
-        assertNull(engine.buildSettingCommand("inmotion_charge_cut_off_percent", 90))
         assertNull(engine.buildSettingCommand("inmotion_standby_time", 30))
-        assertNull(engine.buildSettingCommand("inmotion_max_charge_current_ac220", 20))
         assertNull(engine.buildSettingCommand("inmotion_low_battery_ride", 1))
         assertNull(engine.buildSettingCommand("inmotion_lock_mode", 1))
         assertNull(engine.buildSettingCommand("inmotion_transport_mode", 1))
@@ -1010,6 +1062,34 @@ class InmotionProtocolEngineTest {
         engine.consume(buildFrame(0x14, 0x20, ByteArray(49)))
 
         assertEquals(emptyList(), engine.settingsCapabilities())
+    }
+
+    @Test
+    fun exposesP6ChargingControlsAndUsesTheSharedValidatedPackets() {
+        val engine = InmotionProtocolEngine()
+        engine.consume(buildFrame(0x11, 0x02, byteArrayOf(1, 2, 13, 1)))
+        val payload = ByteArray(49)
+        payload[42] = 90
+        payload[43] = 30
+        payload[44] = 30
+        engine.consume(buildFrame(0x14, 0x20, payload))
+        val capabilities = engine.settingsCapabilities().associateBy { it.key }
+        val cutoff = capabilities.getValue("inmotion_charge_cut_off_percent")
+        assertEquals("slider", cutoff.kind)
+        assertEquals(5, cutoff.step)
+        val current = capabilities.getValue("inmotion_max_charge_current_ac220")
+        assertEquals(10, current.step)
+        assertEquals(10, current.minValue)
+        assertEquals(160, current.maxValue)
+        assertEquals(80, capabilities.getValue("inmotion_max_charge_current_ac110").maxValue)
+        assertNull(engine.buildSettingCommand(cutoff.key, 91))
+        assertEquals("AAAA560105022160385F76", engine.buildSettingCommand(cutoff.key, 95)?.hex())
+        assertEquals("AAAA56020602216039321E04", engine.buildSettingCommand(current.key, 50)?.hex())
+
+        val v11 = InmotionProtocolEngine()
+        v11.consume(buildFrame(0x11, 0x02, byteArrayOf(1, 2, 6, 1)))
+        v11.consume(buildFrame(0x14, 0x20, ByteArray(42)))
+        assertNull(v11.buildSettingCommand(cutoff.key, 95))
     }
 
     /**
@@ -1159,7 +1239,7 @@ private fun ByteArray.hex(): String = joinToString("") { byte ->
     (byte.toInt() and 0xFF).toString(16).padStart(2, '0').uppercase()
 }
 
-/** Inverse of the engine's `u8 + 80 - 256` temperature scale. */
+/** Inverse of the engine's signed `+80` temperature scale. */
 private fun celsius(value: Int): Byte = (value - 80 + 256).toByte()
 
 private fun ByteArray.putInt16Le(offset: Int, value: Int) {

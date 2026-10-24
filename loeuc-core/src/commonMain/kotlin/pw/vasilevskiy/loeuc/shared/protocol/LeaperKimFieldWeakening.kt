@@ -71,6 +71,18 @@ private val KnownCalibrations = listOf(
         firmwareVersion = 9004,
         mode = newVoltageCalibration(),
     ),
+    LeaperKimFieldWeakeningCalibration(
+        // 010.0.02: regulator at 0x0801D214, constants read from the stock firmware.
+        hardwareCode = "0100",
+        firmwareVersion = 10002,
+        mode = LeaperKimFieldWeakeningCalibration.Mode.VoltageThreshold(
+            normalBase = -480.0,
+            normalThreshold = 3_850.0,
+            highSpeedBase = -700.0,
+            highSpeedThreshold = 4_700.0,
+            slope = 4.0,
+        ),
+    ),
 )
 
 private fun newVoltageCalibration(): LeaperKimFieldWeakeningCalibration.Mode {

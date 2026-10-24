@@ -6,9 +6,9 @@ import pw.vasilevskiy.loeuc.shared.protocol.KingSongTelemetry
 /**
  * KingSong telemetry under brand-neutral names.
  *
- * KingSong reports no charge level, no MOSFET or motor probe and no lean angle, so those
- * metrics are absent. [KingSongTelemetry.secondaryTemperature] is deliberately not mapped: it
- * is the second, slower probe the engine keeps apart from the live one.
+ * KingSong reports no charge level, no MOSFET probe and no lean angle, so those metrics are
+ * absent. It does report a motor probe - the slower of its two temperature sensors, see
+ * [KingSongTelemetry.motorTemperature].
  */
 fun KingSongTelemetry.toDeviceTelemetry(): DeviceTelemetry = DeviceTelemetry.of(
     DeviceMetric.SpeedKmh to speedKmh,
@@ -18,6 +18,7 @@ fun KingSongTelemetry.toDeviceTelemetry(): DeviceTelemetry = DeviceTelemetry.of(
     DeviceMetric.PhaseCurrentA to phaseCurrent,
     DeviceMetric.PowerW to power,
     DeviceMetric.ControllerTemperatureC to temperature,
+    DeviceMetric.MotorTemperatureC to motorTemperature,
     DeviceMetric.TripDistanceKm to tripDistanceMeters / MetresPerKilometre,
     DeviceMetric.TotalDistanceKm to totalDistanceKm,
 )

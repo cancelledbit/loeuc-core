@@ -1,6 +1,8 @@
 plugins {
     id("org.jetbrains.kotlin.multiplatform") version "2.4.10" apply false
     id("com.android.kotlin.multiplatform.library") version "9.3.1" apply false
+    id("com.android.library") version "9.3.1" apply false
+    id("com.android.application") version "9.3.1" apply false
     id("org.jetbrains.kotlin.jvm") version "2.4.10" apply false
 }
 
@@ -21,7 +23,10 @@ private val tripleQuoted = Regex("\"\"\".*?\"\"\"", RegexOption.DOT_MATCHES_ALL)
 // Unrolled rather than `("[^"\\]|\\.)*"`: the alternation form recurses once per character
 // and blows the stack on the larger catalogs.
 private val singleQuoted = Regex("\"[^\"\\\\\\n]*(?:\\\\.[^\"\\\\\\n]*)*\"")
-private val charLiteral = Regex("'[^'\\\\]*(?:\\\\.[^'\\\\]*)*'")
+// The newline exclusion is what stops an apostrophe in English prose ("the rider's") from
+// pairing with an unrelated apostrophe hundreds of lines later and blanking every comment in
+// between - which silently disabled the "Russian outside a string literal" check on whole files.
+private val charLiteral = Regex("'[^'\\\\\n]*(?:\\\\.[^'\\\\\n]*)*'")
 
 /** Source text with string and character literals blanked, so only code and comments remain. */
 private fun outsideLiterals(text: String): String =
@@ -118,6 +123,14 @@ tasks.register("checkOpenSourceHygieneFixture") {
         check(guttedCommentLines("val timeoutMs = 0L // 0 =") == 1)
         check(guttedCommentLines("val timeoutMs = 0L // 0 means no reset") == 0)
         check(guttedCommentLines("assertEquals(x, y) // 64 * 8 = 512") == 0)
+        // An apostrophe in prose must not open a character literal that swallows later lines:
+        // everything between two such apostrophes used to be blanked, comments included.
+        check(
+            Regex("[\\u0400-\\u04FF]").containsMatchIn(
+                outsideLiterals("// the rider's pedals\n// \u041f\u0435\u0434\u0430\u043b\u0438\n// it's fine")
+            )
+        )
+        check(outsideLiterals("val c = 'x'") == "val c = ''")
         check(guttedCommentLines("     * ```") == 0)
         check(guttedCommentLines("     */") == 0)
     }

@@ -35,4 +35,27 @@ enum class SeverityBand(
         /** The most critical band in the list, or null when the list is empty. */
         fun worst(bands: List<SeverityBand>): SeverityBand? = bands.minByOrNull { it.ordinal }
     }
+
+    /**
+     * Haptic pattern of the band: pause, buzz, pause, buzz - in milliseconds.
+     *
+     * The pulses are equally short in all three bands; what tells them apart is how many
+     * there are, not how long each one lasts. A longer buzz reads as a stronger motor, not
+     * as a more urgent alert, and on a wrist it stops being a pulse at all.
+     *
+     * It lives here rather than on either platform because the watch and the phone have to
+     * agree: a rider wearing both must not feel two different alarms for one event.
+     */
+    fun vibrationTimingsMs(): LongArray = when (this) {
+        Critical -> longArrayOf(0L, 60L, 55L, 60L)
+        Warning -> longArrayOf(0L, 90L)
+        Info -> longArrayOf(0L, 70L)
+    }
+
+    /** Amplitude of every step in [vibrationTimingsMs], 0..255, for motors that can vary it. */
+    fun vibrationAmplitudes(): IntArray = when (this) {
+        Critical -> intArrayOf(0, 255, 0, 255)
+        Warning -> intArrayOf(0, 190)
+        Info -> intArrayOf(0, 130)
+    }
 }

@@ -19,6 +19,7 @@ fun BegodeTelemetry.toDeviceTelemetry(): DeviceTelemetry = DeviceTelemetry.of(
     DeviceMetric.BatteryCurrentA to current,
     DeviceMetric.PhaseCurrentA to phaseCurrent,
     DeviceMetric.PowerW to power,
+    DeviceMetric.ApparentPowerVa to apparentPower,
     DeviceMetric.BatteryPercent to batteryPercent,
     DeviceMetric.ControllerTemperatureC to temperature,
     DeviceMetric.MotorTemperatureC to motorTemperature,

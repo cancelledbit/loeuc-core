@@ -129,4 +129,24 @@ class LeaperKimPluginUploadTest {
         assertEquals(0, bytes.size % 16, "every frame is twelve bytes of body and four of CRC32")
         assertEquals(4, bytes.size / 16, "unlock, erase, and one write per halfword")
     }
+
+    @Test
+    fun the_bench_uploads_exactly_the_stream_this_builder_emits() {
+        // The firmware bench mirrors this builder in Python to push plugins through the wheel's
+        // real receiver, and a receiver that checks the body CRC while it writes refuses any
+        // stream that is not in this exact order. These digests were computed by that mirror; if
+        // the builder changes, the bench is no longer testing what an app sends.
+        val engine = LeaperKimProtocolEngine()
+        val even = ByteArray(300) { ((it * 7 + 3) and 0xFF).toByte() }
+        val odd = even.copyOf(299)
+        val twoPages = ByteArray(5000) { ((it * 13 + 5) and 0xFF).toByte() }
+        for ((stream, size, crc) in listOf(
+            Triple(engine.buildPluginUploadFrames(even, slot = 3), 2432, 0x39A307E7L),
+            Triple(engine.buildPluginUploadFrames(odd, slot = 3), 2432, 0xD2146D3BL),
+            Triple(engine.buildPluginUploadFrames(twoPages, slot = 20), 40048, 0xF4B55F69L),
+        )) {
+            assertEquals(size, stream.size)
+            assertEquals(crc, LeaperKimFirmwareDigests.crc32(stream, 0))
+        }
+    }
 }

@@ -17,7 +17,7 @@ data class WheelSettingGroup(
 )
 
 object WheelSettingGroups {
-    val Ride = WheelSettingGroup("ride", 0, "Ride feel", "Управление")
+    val Ride = WheelSettingGroup("ride", 0, "Ride feel", "Педали и характер езды")
     val Speed = WheelSettingGroup("speed", 1, "Speed and limits", "Скорость и пороги")
     val Light = WheelSettingGroup("light", 2, "Lighting", "Свет")
     val Sound = WheelSettingGroup("sound", 3, "Sound", "Звук")
@@ -25,7 +25,7 @@ object WheelSettingGroups {
     val Safety = WheelSettingGroup("safety", 5, "Sensors and protection", "Датчики и защита")
     val System = WheelSettingGroup("system", 6, "System", "Система")
     val Other = WheelSettingGroup("other", 7, "Other", "Прочее")
-    val Raw = WheelSettingGroup("raw", 8, "Raw block", "Сырые байты блока")
+    val Raw = WheelSettingGroup("raw", 8, "Raw block", "Нерасшифрованные данные")
 
     val all: List<WheelSettingGroup> =
         listOf(Ride, Speed, Light, Sound, Battery, Safety, System, Other, Raw)
@@ -112,6 +112,12 @@ object WheelSettingGroups {
             "inmotion_legacy_pedal_hardness",
             "inmotion_legacy_pedal_tilt",
             "inmotion_legacy_ride_mode",
+            // LeaperKim. Its keys carry no brand prefix - that is how they arrived from the
+            // protocol, and renaming them would break saved presets and alert rules. Two of
+            // the brand's seventeen settings used to sit here and the other fifteen fell
+            // through `else` into Other, which is not a layout but the absence of one.
+            "acc_dec_helper",
+            "acc_reduction",
             -> Ride
 
             "inmotion_speed_limit",
@@ -139,6 +145,12 @@ object WheelSettingGroups {
             "inmotion_speed_limit_unlock",
             "begode_cf_pwm_tiltback",
             "inmotion_legacy_max_speed",
+            // LeaperKim: tilt-back speed, PWM threshold, alarm speed and high-speed mode -
+            // all four are about the limit past which the wheel starts interfering.
+            "stop_speed",
+            "stop_power",
+            "speed_alarm",
+            "high_speed_mode",
             -> Speed
 
             "inmotion_auto_light_state",
@@ -172,6 +184,9 @@ object WheelSettingGroups {
             "kingsong_strobe",
             "inmotion_legacy_headlight",
             "inmotion_legacy_decorative_light",
+            // LeaperKim: the screen backlight is the only light the brand exposes as a
+            // setting; its headlight is a command, not a settings row.
+            "screen_backlight",
             -> Light
 
             "inmotion_audio_switch",
@@ -182,6 +197,8 @@ object WheelSettingGroups {
             "begode_buzzer_volume",
             "kingsong_voice_prompts",
             "inmotion_legacy_speaker_volume",
+            // LeaperKim: button tone volume is the only sound it has.
+            "key_tone",
             -> Sound
 
             "inmotion_charge_cut_off_percent",
@@ -193,6 +210,11 @@ object WheelSettingGroups {
             "kingsong_charge_limit",
             "begode_power_margin",
             "begode_power_margin_tiltback",
+            // LeaperKim: charge ceiling, low-battery mode and the voltage correction. The
+            // last one belongs here because it trims what the pack reads, not how it rides.
+            "max_charge_voltage",
+            "low_voltage_mode",
+            "voltage_correction",
             -> Battery
 
             "inmotion_lift_up_detection",
@@ -205,6 +227,11 @@ object WheelSettingGroups {
             "inmotion_shield_tps_error",
             "ninebot_lock_mode",
             "inmotion_legacy_handle_button",
+            // LeaperKim: brake overpressure alarm and gyro calibration. The second stays
+            // read-only - no brand exposes calibration to a remote trigger, which is project
+            // policy rather than a gap; see `LeaperKimProtocolEngine`.
+            "brake_overpressure_alarm",
+            "gyro_calibration",
             -> Safety
 
             "inmotion_standby_time",
@@ -220,6 +247,9 @@ object WheelSettingGroups {
             "begode_firmware",
             "begode_units",
             "begode_auto_power_off",
+            // LeaperKim: transport mode and units.
+            "transport_mode",
+            "unit",
             -> System
 
             else -> Other

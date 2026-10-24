@@ -60,12 +60,14 @@ data class BegodeSettingOption(
  * Gyroscope calibration is not here and will not be. Its bytes are documented so they can
  * be recognised, never sent.
  *
- * ## Why half of these have no current value
+ * ## Where the current values come from
  *
- * The wheel confirms nothing it is told, and reports only five of its settings back: frame
- * `type=4 page=24` carries the tilt-back speed, the auto power-off timer, the unit flag and
- * the ride mode, and `type=1 @2` carries the power margin. Everything else is write-only
- * from the phone's side.
+ * The wheel confirms nothing it is told, but its ordinary telemetry carries most of its
+ * settings: `type=4 page=24` the tilt-back speed, the auto power-off timer, the units, the
+ * ride mode, the speed-alarm mode, the side-fall level and the LED mode; `type=1 @2` the power
+ * margin; `type=7 @5` field weakening and the side-fall angle; and `type=0` on a modern stock
+ * wheel the pedal dip, the pedal trim and the buzzer volume. Only the low-power-reserve
+ * tilt-back is write-only. Where each field sits is on [BegodeTelemetry].
  */
 @OptIn(pw.vasilevskiy.loeuc.shared.api.ExperimentalWriteApi::class)
 object BegodeSettingsCatalog {
@@ -226,7 +228,7 @@ object BegodeSettingsCatalog {
     private fun cfPwmTiltback(telemetry: BegodeTelemetry) = BegodeSettingCapability(
         key = CfPwmTiltbackKey,
         titleEn = "PWM tilt-back (Freestyl3r)",
-        titleRu = "Тилтбэк по PWM (Freestyl3r)",
+        titleRu = "Тилтбэк по ШИМ (Freestyl3r)",
         rawValue = telemetry.speedAlarmMode?.let { if (it == CfPwmTiltbackAlarmMode) 1 else 0 },
         sourceOffset = 6,
         commandId = 'I'.code,
@@ -267,7 +269,7 @@ object BegodeSettingsCatalog {
                 readOnly(
                     key = BfTrickKey,
                     titleEn = "Trick",
-                    titleRu = "Трюк",
+                    titleRu = "Трюк (SmirnoV)",
                     rawValue = trick,
                     sourceOffset = 16,
                     valueTextEn = when (trick) {
@@ -316,7 +318,7 @@ object BegodeSettingsCatalog {
                 valueTextRu = "${settings.rotationAngleDegrees}°",
             ),
         )
-        add(flag(BfAdvancedSettingsKey, "Advanced settings", "Расширенные настройки", settings.advancedSettings, 6))
+        add(flag(BfAdvancedSettingsKey, "Advanced settings", "Расширенные настройки прошивки", settings.advancedSettings, 6))
         add(number(BfProportionalFactorKey, "Balance PID: P", "ПИД баланса: P", settings.proportionalFactor, 7))
         add(number(BfIntegralFactorKey, "Balance PID: I", "ПИД баланса: I", settings.integralFactor, 8))
         add(number(BfDifferentialFactorKey, "Balance PID: D", "ПИД баланса: D", settings.differentialFactor, 9))
@@ -379,6 +381,30 @@ object BegodeSettingsCatalog {
     /** `type=4 @6` alarm-mode value that means Freestyl3r's PWM tilt-back is on. */
     private const val CfPwmTiltbackAlarmMode = 3
 
+    /**
+     * A reading the row can also write back, or `null`.
+     *
+     * The wheel reports values this catalogue deliberately does not send - field weakening
+     * `0`, a pedal trim of `+5` - and a profile captures whatever the row shows. Shown as-is,
+     * the slider would draw it clamped to its end, and applying the profile would write that
+     * end: a different value from the one the wheel holds. Unknown is the honest answer for a
+     * value the row cannot represent.
+     */
+    private fun Int?.withinWritable(min: Int, max: Int): Int? = this?.takeIf { it in min..max }
+
+    /**
+     * The first-alarm switch's position from the alarm mode the wheel reports.
+     *
+     * Wire `0` is `o`, both alarms armed - the switch on; `1` is `u`, the first one off. `2` is
+     * the `i` letter this catalogue does not send because its two readings disagree about it,
+     * and `3` is Freestyl3r's PWM tilt-back: neither is a position of this switch.
+     */
+    private fun firstAlarmSwitch(alarmMode: Int): Int? = when (alarmMode) {
+        0 -> 1
+        1 -> 0
+        else -> null
+    }
+
     private fun stockCapabilities(telemetry: BegodeTelemetry): List<BegodeSettingCapability> = listOf(
         BegodeSettingCapability(
             key = TiltbackSpeedKey,
@@ -404,7 +430,7 @@ object BegodeSettingsCatalog {
         BegodeSettingCapability(
             key = PowerMarginKey,
             titleEn = "Warn when reserve drops to",
-            titleRu = "Предупреждать при запасе",
+            titleRu = "Предупреждать, когда запас мощности ниже",
             rawValue = telemetry.powerMarginPercent.takeIf { it.isFinite() }?.toInt(),
             sourceOffset = 2,
             commandId = 'P'.code,
@@ -446,10 +472,10 @@ object BegodeSettingsCatalog {
         ),
         BegodeSettingCapability(
             key = SideTiltThresholdKey,
-            titleEn = "Side tilt threshold",
-            titleRu = "Порог бокового наклона",
-            rawValue = null,
-            sourceOffset = -1,
+            titleEn = "Side-fall cutoff angle (level)",
+            titleRu = "Угол отключения при падении набок (уровень)",
+            rawValue = telemetry.sideTiltThreshold,
+            sourceOffset = 6,
             commandId = '>'.code,
             minValue = 0,
             maxValue = 2,
@@ -463,10 +489,12 @@ object BegodeSettingsCatalog {
         ),
         BegodeSettingCapability(
             key = SideTiltAngleKey,
-            titleEn = "Maximum side tilt angle",
-            titleRu = "Предельный угол бокового наклона",
-            rawValue = null,
-            sourceOffset = -1,
+            titleEn = "Side-fall cutoff angle (degrees)",
+            titleRu = "Угол отключения при падении набок (градусы)",
+            rawValue = telemetry.sideTiltAngleIndex?.let {
+                BegodeSettingsWriter.MinSideTiltDegrees + it * BegodeSettingsWriter.SideTiltStepDegrees
+            },
+            sourceOffset = 5,
             commandId = 'X'.code,
             minValue = BegodeSettingsWriter.MinSideTiltDegrees,
             maxValue = BegodeSettingsWriter.MinSideTiltDegrees +
@@ -482,8 +510,8 @@ object BegodeSettingsCatalog {
             key = FieldWeakeningKey,
             titleEn = "Field weakening",
             titleRu = "Ослабление поля",
-            rawValue = null,
-            sourceOffset = -1,
+            rawValue = telemetry.fieldWeakening.withinWritable(min = 1, max = 9),
+            sourceOffset = 5,
             commandId = 'C'.code,
             minValue = 1,
             maxValue = 9,
@@ -493,9 +521,9 @@ object BegodeSettingsCatalog {
         BegodeSettingCapability(
             key = PedalDipKey,
             titleEn = "Pedal dip in turns",
-            titleRu = "Подгиб педалей в поворотах",
-            rawValue = null,
-            sourceOffset = -1,
+            titleRu = "Наклон педалей в поворотах",
+            rawValue = telemetry.pedalDip,
+            sourceOffset = 14,
             commandId = 'R'.code,
             minValue = 0,
             maxValue = 9,
@@ -506,9 +534,9 @@ object BegodeSettingsCatalog {
         BegodeSettingCapability(
             key = PedalTrimKey,
             titleEn = "Pedal horizontal trim",
-            titleRu = "Горизонтальная подстройка педалей",
-            rawValue = null,
-            sourceOffset = -1,
+            titleRu = "Угол педалей",
+            rawValue = telemetry.pedalTrim.withinWritable(min = -BegodeSettingsWriter.PedalTrimCentre, max = 4),
+            sourceOffset = 14,
             commandId = 'U'.code,
             minValue = -BegodeSettingsWriter.PedalTrimCentre,
             maxValue = 4,
@@ -519,8 +547,8 @@ object BegodeSettingsCatalog {
             key = BuzzerVolumeKey,
             titleEn = "Buzzer volume",
             titleRu = "Громкость пищалки",
-            rawValue = null,
-            sourceOffset = -1,
+            rawValue = telemetry.buzzerVolume,
+            sourceOffset = 17,
             commandId = 'B'.code,
             minValue = 1,
             maxValue = 9,
@@ -531,8 +559,8 @@ object BegodeSettingsCatalog {
             key = LedModeKey,
             titleEn = "LED strip mode",
             titleRu = "Режим ленты подсветки",
-            rawValue = null,
-            sourceOffset = -1,
+            rawValue = telemetry.ledMode,
+            sourceOffset = 13,
             commandId = 'M'.code,
             minValue = 0,
             maxValue = 9,
@@ -551,8 +579,8 @@ object BegodeSettingsCatalog {
             key = SpeedAlarmsKey,
             titleEn = "First speed alarm",
             titleRu = "Первый скоростной аларм",
-            rawValue = null,
-            sourceOffset = -1,
+            rawValue = telemetry.speedAlarmMode?.let(::firstAlarmSwitch),
+            sourceOffset = 6,
             commandId = 'o'.code,
             minValue = 0,
             maxValue = 1,

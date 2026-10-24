@@ -78,6 +78,44 @@ class WheelSettingGroupsTest {
         )
     }
 
+    /**
+     * Every LeaperKim setting has a section of its own.
+     *
+     * The brand's keys carry no brand prefix - that is how they arrived from the protocol -
+     * so they used to fall through the `when` into [WheelSettingGroups.Other]: two of its
+     * seventeen settings sat under "Ride feel" and the remaining fifteen in "Other", which
+     * is not a layout but the absence of one.
+     */
+    @Test
+    fun everyLeaperKimSettingHasItsOwnSection() {
+        val placement = mapOf(
+            "pedal_hardness" to WheelSettingGroups.Ride,
+            "angle_trim" to WheelSettingGroups.Ride,
+            "acc_dec_helper" to WheelSettingGroups.Ride,
+            "acc_reduction" to WheelSettingGroups.Ride,
+            "stop_speed" to WheelSettingGroups.Speed,
+            "stop_power" to WheelSettingGroups.Speed,
+            "speed_alarm" to WheelSettingGroups.Speed,
+            "high_speed_mode" to WheelSettingGroups.Speed,
+            "screen_backlight" to WheelSettingGroups.Light,
+            "key_tone" to WheelSettingGroups.Sound,
+            "max_charge_voltage" to WheelSettingGroups.Battery,
+            "low_voltage_mode" to WheelSettingGroups.Battery,
+            "voltage_correction" to WheelSettingGroups.Battery,
+            "brake_overpressure_alarm" to WheelSettingGroups.Safety,
+            "gyro_calibration" to WheelSettingGroups.Safety,
+            "transport_mode" to WheelSettingGroups.System,
+            "unit" to WheelSettingGroups.System,
+        )
+        placement.forEach { (key, group) ->
+            assertEquals(group, WheelSettingGroups.of(key), "key=$key")
+        }
+        // Nothing of the brand is left in the catch-all.
+        assertTrue(placement.keys.none { WheelSettingGroups.of(it) == WheelSettingGroups.Other })
+        // Pedal stiffness still leads the screen, as it does on every other brand.
+        assertEquals(0, WheelSettingGroups.pinRank("pedal_hardness"))
+    }
+
     @Test
     fun rawByteRowsSortLastAndGroupsAreOrdered() {
         assertEquals(WheelSettingGroups.Raw, WheelSettingGroups.of("inmotion_setting_byte_17"))

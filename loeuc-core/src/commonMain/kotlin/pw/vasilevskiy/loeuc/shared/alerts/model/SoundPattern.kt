@@ -16,6 +16,12 @@ data class SoundPattern(
     }
 
     /**
+     * A pattern with no steps plays nothing: the alert keeps its conditions and its wheel
+     * commands but makes no tone and claims no voice slot. See [silent].
+     */
+    val isSilent: Boolean get() = steps.isEmpty()
+
+    /**
      * The same pattern reduced to a single tone: the last step.
      *
      * The last and not the first, because the continuous tone at the top of an accelerating
@@ -48,7 +54,7 @@ data class SoundPattern(
 
         fun tripleWarningAlarm(isRu: Boolean = true) = SoundPattern(
             id = "std_triple_warning",
-            name = if (isRu) "Тройной тревожный аларм" else "Triple warning alarm",
+            name = if (isRu) "Тройной сигнал тревоги" else "Triple warning alarm",
             steps = listOf(
                 SoundStep(frequencyHz = 2200, durationMs = 80, pauseAfterMs = 40, waveShape = WaveShape.SQUARE),
                 SoundStep(frequencyHz = 2400, durationMs = 80, pauseAfterMs = 40, waveShape = WaveShape.SQUARE),
@@ -74,6 +80,22 @@ data class SoundPattern(
                 SoundStep(frequencyHz = 523, durationMs = 220, pauseAfterMs = 0, waveShape = WaveShape.SINE),
             ),
         )
+
+        /**
+         * No sound at all.
+         *
+         * For a rule that exists to change a wheel setting ("speed above 60 -> stiffer
+         * pedals"): the command is the point, and a beep on every crossing is noise. The
+         * engine gives such an alert no voice, so it neither sounds nor mutes a less critical
+         * neighbour, and the platforms' vibration, which follows the voice, stays still too.
+         */
+        fun silent(isRu: Boolean = true) = SoundPattern(
+            id = SILENT_ID,
+            name = if (isRu) "Без звука" else "Silent",
+            steps = emptyList(),
+        )
+
+        const val SILENT_ID = "std_silent"
 
         val LINK_LOST = linkLost(true)
 

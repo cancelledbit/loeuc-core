@@ -1,6 +1,9 @@
 package pw.vasilevskiy.loeuc.shared.api
 
 import pw.vasilevskiy.loeuc.shared.alerts.model.TelemetrySnapshot
+import pw.vasilevskiy.loeuc.shared.protocol.BegodeSettingsWriter
+import pw.vasilevskiy.loeuc.shared.protocol.KingSongSettingsWriter
+import pw.vasilevskiy.loeuc.shared.protocol.InmotionLegacyCommands
 import pw.vasilevskiy.loeuc.shared.protocol.BegodeFirmware
 import pw.vasilevskiy.loeuc.shared.protocol.BegodeProtocolEngine
 import pw.vasilevskiy.loeuc.shared.protocol.BegodeSettingCapability
@@ -126,8 +129,13 @@ sealed interface SettingWriteResult {
      */
     class Queued(val command: ExperimentalWriteCommand) : SettingWriteResult
 
-    /** Nothing was built or queued. */
-    data class Rejected(val reason: String) : SettingWriteResult
+    /**
+     * Nothing was built or queued. [refusal] carries the wording in both languages; [reason] is
+     * the English one, for a log line or a test.
+     */
+    data class Rejected(val refusal: SettingWriteRefusal) : SettingWriteResult {
+        val reason: String get() = refusal.english
+    }
 }
 
 /** Brand-specific update, avoiding an untyped `Any` boundary for Kotlin/Native consumers. */
@@ -200,6 +208,17 @@ class WheelSession private constructor(
 
     /** Latest cumulative neutral telemetry, or an empty container before decoding. */
     val telemetry: DeviceTelemetry get() = last?.telemetry ?: accumulated
+
+    /** The validated horn for the live model; unsupported models return null. */
+    @ExperimentalWriteApi
+    fun hornCommand(): ByteArray? = when (protocol) {
+        WheelProtocol.Begode -> BegodeSettingsWriter.horn()
+        WheelProtocol.KingSong -> KingSongSettingsWriter.horn()
+        WheelProtocol.Inmotion -> inmotion.hornCommand()
+        WheelProtocol.InmotionLegacy -> inmotionLegacy.identity?.model?.let(InmotionLegacyCommands::horn)
+        WheelProtocol.LeaperKim, WheelProtocol.Nosfet -> leaperKim.hornCommand()
+        WheelProtocol.Ninebot, WheelProtocol.SolowheelXtreme -> null
+    }
 
     /** Read-only commands supported by the selected engine. */
     val commands: WheelCommands = commandsFor(protocol)
@@ -315,7 +334,7 @@ class WheelSession private constructor(
                 ),
                 readbacks = KingSongSettingsCatalog.readsFor(key),
             )
-            is KingSongSettingWrite.Rejected -> SettingWriteResult.Rejected(write.reason)
+            is KingSongSettingWrite.Rejected -> SettingWriteResult.Rejected(write.refusal)
         }
         WheelProtocol.InmotionLegacy -> when (
             val write = InmotionLegacySettingsCatalog.write(key, value, inmotionLegacy.identity, inmotionLegacy.settings)
@@ -336,12 +355,22 @@ class WheelSession private constructor(
                         ),
                     )
                 } else {
-                    SettingWriteResult.Rejected("The session already holds the most commands it queues.")
+                    SettingWriteResult.Rejected(
+                        SettingWriteRefusal(
+                            english = "The session already holds the most commands it queues.",
+                            russian = "В очереди сессии уже столько команд, сколько она держит.",
+                        ),
+                    )
                 }
             }
-            is InmotionLegacySettingWrite.Rejected -> SettingWriteResult.Rejected(write.reason)
+            is InmotionLegacySettingWrite.Rejected -> SettingWriteResult.Rejected(write.refusal)
         }
-        else -> SettingWriteResult.Rejected("No session setting writes for $protocol.")
+        else -> SettingWriteResult.Rejected(
+            SettingWriteRefusal(
+                english = "No session setting writes for $protocol.",
+                russian = "Для $protocol запись настроек через сессию не поддерживается.",
+            ),
+        )
     }
 
     /** Resets the decoder and every accumulated projection. */

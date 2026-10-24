@@ -2,6 +2,7 @@ package pw.vasilevskiy.loeuc.shared.protocol
 
 import pw.vasilevskiy.loeuc.shared.api.ExperimentalWriteApi
 import pw.vasilevskiy.loeuc.shared.api.InmotionLegacySettingKeys
+import pw.vasilevskiy.loeuc.shared.api.SettingWriteRefusal
 import kotlin.math.roundToInt
 
 /**
@@ -47,7 +48,13 @@ sealed interface InmotionLegacySettingWrite {
         val bytes: ByteArray get() = wire.copyOf()
     }
 
-    data class Rejected(val reason: String) : InmotionLegacySettingWrite
+    /**
+     * Nothing was built. [refusal] carries the wording in both languages; [reason] is the
+     * English one, for a log line or a test.
+     */
+    data class Rejected(val refusal: SettingWriteRefusal) : InmotionLegacySettingWrite {
+        val reason: String get() = refusal.english
+    }
 }
 
 /**
@@ -240,13 +247,18 @@ object InmotionLegacySettingsCatalog {
         identity: InmotionLegacyIdentity?,
         settings: InmotionLegacySettings?,
     ): InmotionLegacySettingWrite {
-        val setting = settingFor(key) ?: return InmotionLegacySettingWrite.Rejected("Unknown legacy InMotion setting $key.")
-        val model = identity?.model ?: return InmotionLegacySettingWrite.Rejected("Wheel model is unknown.")
+        val setting = settingFor(key) ?: return InmotionLegacySettingWrite.Rejected(SettingWriteRefusal.unknownSetting(key))
+        val model = identity?.model ?: return InmotionLegacySettingWrite.Rejected(SettingWriteRefusal.modelUnknown())
         if (InmotionLegacyCommands.range(setting, model) == null) {
-            return InmotionLegacySettingWrite.Rejected("${model.displayName} has no such setting.")
+            return InmotionLegacySettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "${model.displayName} has no such setting.",
+                    russian = "У ${model.displayName} такой настройки нет.",
+                ),
+            )
         }
         if (setting !in InmotionLegacyCommands.writableSettings(identity, settings)) {
-            return InmotionLegacySettingWrite.Rejected("The wheel does not report this setting back.")
+            return InmotionLegacySettingWrite.Rejected(SettingWriteRefusal.noReadback())
         }
         return write(key, value, model)
     }
@@ -259,14 +271,24 @@ object InmotionLegacySettingsCatalog {
      */
     @ExperimentalWriteApi
     fun write(key: String, value: Int, model: InmotionLegacyModel): InmotionLegacySettingWrite {
-        val setting = settingFor(key) ?: return InmotionLegacySettingWrite.Rejected("Unknown legacy InMotion setting $key.")
+        val setting = settingFor(key) ?: return InmotionLegacySettingWrite.Rejected(SettingWriteRefusal.unknownSetting(key))
         val range = InmotionLegacyCommands.range(setting, model)
-            ?: return InmotionLegacySettingWrite.Rejected("${model.displayName} has no such setting.")
+            ?: return InmotionLegacySettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "${model.displayName} has no such setting.",
+                    russian = "У ${model.displayName} такой настройки нет.",
+                ),
+            )
         if (value !in range) {
-            return InmotionLegacySettingWrite.Rejected("Value must be ${range.first}..${range.last}.")
+            return InmotionLegacySettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "Value must be ${range.first}..${range.last}.",
+                    russian = "Значение: от ${range.first} до ${range.last}.",
+                ),
+            )
         }
         val bytes = InmotionLegacyCommands.build(setting, value, model)
-            ?: return InmotionLegacySettingWrite.Rejected("Value is outside validated range.")
+            ?: return InmotionLegacySettingWrite.Rejected(SettingWriteRefusal.outsideValidatedRange())
         return InmotionLegacySettingWrite.Command(setting, bytes)
     }
 

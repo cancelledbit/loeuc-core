@@ -9,7 +9,7 @@ package pw.vasilevskiy.loeuc.shared.protocol
  * needs the same answer for the same reason - a wheel without a smart BMS reports no percent
  * and no cells - and two copies of a curve are two curves the moment one of them is touched.
  */
-internal object CellChargeCurve {
+object CellChargeCurve {
 
     /** Bounds a series-cell count has to fall inside to be worth dividing by. */
     const val MIN_SERIES_CELLS = 10
@@ -39,6 +39,16 @@ internal object CellChargeCurve {
         4.15 to 100.0,
     )
 
+    /**
+     * Charge from one cell's voltage.
+     *
+     * Public because a shell needs the same curve for a question the engines never ask: how much
+     * charge a *ride* used, when the wheel only reports whole percent and a short ride never
+     * moves that number. That is a difference between two readings rather than an absolute
+     * charge, so a shell may divide by a series-cell count it guessed - and must then say the
+     * answer is approximate. This object still refuses to guess the count itself; see
+     * [percentFromPackVoltage].
+     */
     fun percentFromCellVoltage(cellVoltage: Double): Double {
         if (cellVoltage.isNaN()) return Double.NaN
         val first = points.first()

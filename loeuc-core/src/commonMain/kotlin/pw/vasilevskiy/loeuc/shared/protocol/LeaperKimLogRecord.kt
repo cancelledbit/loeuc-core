@@ -21,7 +21,11 @@ data class LeaperKimLogRecord(
     val totalCount: Int,
     /** Cursor position of this record, 1-based. */
     val index: Int,
-    /** Four raw timestamp bytes. Their encoding is not established. */
+    /**
+     * Four raw timestamp bytes: Unix seconds, big-endian, the way the official app reads them
+     * (`LogItemInfo.getShowTime`, `bytesToLong` then `formatTimeWithSeconds(t * 1000)`). Zero
+     * means the wheel had no clock when it logged the event.
+     */
     val timeBytes: List<Int>,
     /** The event code the firmware logged this record under. */
     val code: Int,
@@ -30,13 +34,69 @@ data class LeaperKimLogRecord(
     /** The event's own name, e.g. `mCoilOver166`. Non-ASCII bytes are escaped, not dropped. */
     val text: String,
 ) {
+    /** [timeBytes] as Unix seconds, or null when the wheel logged no time (all zero). */
+    val unixSeconds: Long?
+        get() {
+            val value = timeBytes.fold(0L) { acc, byte -> (acc shl 8) or (byte.toLong() and 0xFF) }
+            return value.takeIf { it != 0L }
+        }
+
+    /** True for the marker the wheel sends once its cursor runs out, not for an event. */
+    val isEndMarker: Boolean
+        get() = index == LEAPERKIM_LOG_END_INDEX_PAGE33 && totalCount >= 0 ||
+            totalCount < 0 && index == LEAPERKIM_LOG_END_INDEX_PAGE32
+
     /** The header line the debug screen shows: everything except the values. */
     val summary: String
         get() = "#$index/$totalCount code=$code time=${timeBytes.joinToString(".")}"
 }
 
 private const val LOG_PAGE_ID = 33
+private const val LOG_PAGE_32_ID = 32
 private const val PAGE_ID_OFFSET = 46
+
+/**
+ * Index of the page-33 record that ends a read: the cursor parked at `0xFFF`. The official app
+ * stops on it (`LogUploadActivity.onReceiveLog`, `isMode33 && index == 4095`) and sends nothing.
+ */
+const val LEAPERKIM_LOG_END_INDEX_PAGE33 = 4095
+
+/** The same end marker for the older page-32 log, whose index is one byte. */
+const val LEAPERKIM_LOG_END_INDEX_PAGE32 = 255
+
+/**
+ * Parses the older page-`32` log out of a reassembled `DC 5A 5C` frame: up to three records per
+ * frame, each an index, a two-byte event code, four time bytes and five extra bytes. Returns an
+ * empty list for any other page or a frame too short to carry them.
+ *
+ * Offsets follow the official app (`BtManager.handleFullSingleData`, `bByteValue2 == 32`),
+ * including its guard `size - 4 > 80`. Records from this page have no total count and no text,
+ * so [LeaperKimLogRecord.totalCount] is `-1` and the five extras are carried as [values].
+ */
+fun parseLeaperKimLogPage32Records(frame: ByteArray): List<LeaperKimLogRecord> {
+    if (frame.size <= PAGE_ID_OFFSET) return emptyList()
+    if (frame[PAGE_ID_OFFSET].toInt() and 0xFF != LOG_PAGE_32_ID) return emptyList()
+    if (frame.size - 4 <= 80) return emptyList()
+
+    fun byte(index: Int): Int = frame[index].toInt() and 0xFF
+    fun signed(index: Int): Long = frame[index].toLong()
+
+    val first = byte(47)
+    return (0 until 3).mapNotNull { slot ->
+        val index = first + slot
+        // The app emits the second record only below 255 and the third only below 254.
+        if (slot > 0 && index > LEAPERKIM_LOG_END_INDEX_PAGE32) return@mapNotNull null
+        val base = 48 + slot * 11
+        LeaperKimLogRecord(
+            totalCount = -1,
+            index = index,
+            timeBytes = listOf(byte(base + 2), byte(base + 3), byte(base + 4), byte(base + 5)),
+            code = (byte(base) shl 8) or byte(base + 1),
+            values = (base + 6..base + 10).map(::signed),
+            text = "",
+        )
+    }
+}
 
 /**
  * Parses a page-`33` record out of a reassembled `DC 5A 5C` frame, or returns null when the frame is
@@ -89,6 +149,90 @@ fun parseLeaperKimLogRecord(frame: ByteArray): LeaperKimLogRecord? {
         values = values,
         text = builder.toString(),
     )
+}
+
+/**
+ * One read of the event log, accumulated out of the live byte stream.
+ *
+ * The wheel does not announce where the log ends: the records simply stop arriving, and a cursor
+ * that ran out is reported once as an end marker. So a reader needs three things at the same time
+ * - the records so far, keyed by index because the same record arrives again after a retry; the
+ * fact that the end marker went by; and what came from the wheel instead of records, which is the
+ * only thing that separates "the wheel is silent" from "the wheel is talking but not sending the
+ * log". All three live here so the phone shells do not each grow their own copy.
+ *
+ * Both pages the official app knows are accepted, as on Android's screen: `33` carries one record
+ * with its text per frame, the older `32` three records without text.
+ */
+class LeaperKimLogSession {
+
+    private val reassembler = LeaperKimFrameReassembler()
+    private val byIndex = mutableMapOf<Int, LeaperKimLogRecord>()
+    private val pages = mutableMapOf<Int, Int>()
+
+    /** Frames that arrived since [reset], of any page. */
+    var framesSeen: Int = 0
+        private set
+
+    /** True once the wheel sent the end marker: its cursor ran out and no record follows. */
+    var isEnded: Boolean = false
+        private set
+
+    /** Starts a new read. The half-assembled tail of the previous one goes with it. */
+    fun reset() {
+        reassembler.reset()
+        byIndex.clear()
+        pages.clear()
+        framesSeen = 0
+        isEnded = false
+    }
+
+    /** Feeds one notification. Frames it completes are counted and parsed. */
+    fun consume(chunk: ByteArray) {
+        reassembler.consume(chunk).forEach(::consumeFrame)
+    }
+
+    /** Feeds one already reassembled frame, for a caller that keeps its own capture. */
+    fun consumeFrame(frame: ByteArray) {
+        framesSeen++
+        if (frame.size > PAGE_ID_OFFSET) {
+            val page = frame[PAGE_ID_OFFSET].toInt() and 0xFF
+            pages[page] = (pages[page] ?: 0) + 1
+        }
+        val parsed = parseLeaperKimLogRecord(frame)?.let(::listOf)
+            ?: parseLeaperKimLogPage32Records(frame)
+        parsed.forEach { record ->
+            if (record.isEndMarker) isEnded = true else byIndex[record.index] = record
+        }
+    }
+
+    /** What the wheel has handed over so far, in cursor order. */
+    val records: List<LeaperKimLogRecord>
+        get() = byIndex.values.sortedBy { it.index }
+
+    /**
+     * Which pages arrived while reading, e.g. `"0x40, 8x2"` - the diagnostics line shown when no
+     * record came. The separator is the multiplication sign, as on Android's screen.
+     */
+    fun pagesSummary(): String =
+        pages.entries.sortedBy { it.key }.joinToString(", ") { (page, count) -> "$page×$count" }
+
+    companion object {
+        /**
+         * Silence this long with not one record means the wheel never answered.
+         *
+         * Longer than [EndOfLogTimeoutMillis] because the first record has to wait for the wheel's
+         * scheduler to swap page `33` in, while every later one follows the previous frame.
+         */
+        const val NoAnswerTimeoutMillis: Long = 6_000
+
+        /** Silence this long after a record is the end of the log. */
+        const val EndOfLogTimeoutMillis: Long = 3_000
+
+        /** How long to wait for the next record, given how many have arrived. */
+        fun timeoutMillis(recordCount: Int): Long =
+            if (recordCount == 0) NoAnswerTimeoutMillis else EndOfLogTimeoutMillis
+    }
 }
 
 private fun Int.toHexPair(): String {

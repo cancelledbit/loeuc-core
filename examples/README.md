@@ -53,10 +53,22 @@ The alert section is the ramp in one screen: the same rule beeps slowly at 42 km
 often and higher at 50, and stops beeping altogether at 58 - past 90% of the way to its ceiling
 it holds one continuous tone. A rider hears where they are on the curve without reading anything.
 
+## Android extension
+
+`examples/android-extension` is a complete extension for the LoEUC app: a range estimate as a
+row of the Extensions tile, an alert below a reserve, and a horn command. It is a module of this
+build, so it compiles against the contract on every run:
+
+```bash
+./gradlew :examples:android-extension:assembleDebug
+```
+
+See `docs/extensions.md` for what each part does.
+
 ## Android
 
-There is no Android example module, because the interesting part is three lines inside a
-callback you already own. A session is a plain object; keep one per connected device and feed it
+There is no Android example module for the library itself, because the interesting part is
+three lines inside a callback you already own. A session is a plain object; keep one per connected device and feed it
 whatever arrives:
 
 ```kotlin

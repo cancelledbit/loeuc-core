@@ -304,13 +304,13 @@ class BegodeCustomFirmwareTest {
         val requests = BegodeIdentityRequests()
         val engine = BegodeProtocolEngine()
         val midNotify = hex("5a5a5a5a") + "NAME:RS".encodeToByteArray()
-        requests.onNotify(midNotify)
+        requests.onNotify(midNotify, 0L)
         engine.consume(midNotify)
         assertNull(requests.modelName)
         assertNull(engine.modelName())
 
         val atStart = "NAME:RS".encodeToByteArray()
-        requests.onNotify(atStart)
+        requests.onNotify(atStart, 0L)
         engine.consume(atStart)
         assertEquals("RS", requests.modelName)
         assertEquals("RS", engine.modelName())
@@ -319,18 +319,21 @@ class BegodeCustomFirmwareTest {
     @Test
     fun identityQueriesAlternateUntilAnswered() {
         val requests = BegodeIdentityRequests()
+        val interval = BegodeIdentityRequests.RETRY_INTERVAL_MILLIS
+        val stream = hex("55aa")
 
+        requests.onNotify(stream, 0L)
         assertEquals("N", ascii(requests.nextRequest(0L)))
-        assertNull(requests.nextRequest(50L), "not before the retry interval")
-        assertEquals("V", ascii(requests.nextRequest(100L)))
-        assertEquals("N", ascii(requests.nextRequest(200L)))
+        requests.onNotify(stream, interval / 2)
+        assertNull(requests.nextRequest(interval / 2), "not before the retry interval")
+        requests.onNotify(stream, interval)
+        assertEquals("V", ascii(requests.nextRequest(interval)))
 
-        requests.onNotify("NAME:RS\r\n".encodeToByteArray())
-        assertEquals("V", ascii(requests.nextRequest(300L)))
-        assertEquals("V", ascii(requests.nextRequest(400L)), "the name is known, only V is left")
+        requests.onNotify("NAME:RS\r\n".encodeToByteArray(), 2 * interval)
+        assertEquals("V", ascii(requests.nextRequest(2 * interval)), "the name is known, only V is left")
 
-        requests.onNotify(hex("475732303032303031"))
-        assertNull(requests.nextRequest(500L))
+        requests.onNotify(hex("475732303032303031"), 3 * interval)
+        assertNull(requests.nextRequest(3 * interval))
         assertTrue(requests.isFinished)
         assertEquals("RS", requests.modelName)
         assertEquals("2002001", requests.firmware?.version)
@@ -339,7 +342,10 @@ class BegodeCustomFirmwareTest {
     @Test
     fun aWheelThatNeverAnswersIsAskedABoundedNumberOfTimes() {
         val requests = BegodeIdentityRequests()
-        val sent = (0 until 1_000).mapNotNull { tick -> requests.nextRequest(tick * 100L) }
+        val sent = (0 until 1_000).mapNotNull { tick ->
+            requests.onNotify(hex("55aa"), tick * 100L)
+            requests.nextRequest(tick * 100L)
+        }
 
         assertEquals(2 * BegodeIdentityRequests.MAX_ATTEMPTS, sent.size)
         assertEquals(BegodeIdentityRequests.MAX_ATTEMPTS, sent.count { it.single() == BegodeIdentityRequests.VersionQuery })
@@ -350,13 +356,17 @@ class BegodeCustomFirmwareTest {
     @Test
     fun aFailedWriteDoesNotCountAsAnAttempt() {
         val requests = BegodeIdentityRequests()
+        val interval = BegodeIdentityRequests.RETRY_INTERVAL_MILLIS
 
+        requests.onNotify(hex("55aa"), 0L)
         requests.nextRequest(0L)
         requests.onWriteFailed(10L)
 
         assertEquals(0, requests.nameAttempts)
+        requests.onNotify(hex("55aa"), 50L)
         assertNull(requests.nextRequest(50L))
-        assertEquals("N", ascii(requests.nextRequest(110L)))
+        requests.onNotify(hex("55aa"), 10L + interval)
+        assertEquals("N", ascii(requests.nextRequest(10L + interval)))
     }
 
     private fun legacyLiveFrame(speedRaw: Int, phaseRaw: Int): ByteArray = frame(type = 0, page = 24).apply {

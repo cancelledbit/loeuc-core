@@ -63,21 +63,25 @@ object MetricSpeech {
      * the rider has time to read it; a phrase said at speed has neither.
      */
     private fun defaultNameRu(metric: MetricId): String = when (metric) {
+        MetricId.PHONE_GPS_SPEED_KMH, MetricId.DRAGY_SPEED_KMH, MetricId.DRAGY_SATELLITES,
+        MetricId.DRAGY_HACC_M, MetricId.DRAGY_HEADING_DEG, MetricId.DRAGY_ALT_M,
+        MetricId.DRAGY_FIX_TYPE, MetricId.DRAGY_BATTERY_PERCENT -> metric.displayName(isRu = true)
         MetricId.SPEED_KMH -> "Скорость"
         MetricId.GPS_SPEED_KMH -> "Скорость по GPS"
         MetricId.PWM_PERCENT -> "ШИМ"
         MetricId.VOLTAGE_V -> "Напряжение"
-        MetricId.CELL_VOLTAGE_AVG_V -> "Ячейка"
-        MetricId.CELL_VOLTAGE_DELTA_V -> "Перепад ячеек"
+        MetricId.CELL_VOLTAGE_AVG_V -> "Средняя ячейка"
+        MetricId.CELL_VOLTAGE_DELTA_V -> "Разброс ячеек"
         MetricId.CURRENT_A -> "Ток"
+        MetricId.BUS_CURRENT_A -> "Ток шины"
         MetricId.PHASE_CURRENT_A -> "Фазный ток"
         MetricId.POWER_W -> "Мощность"
-        MetricId.BATTERY_PERCENT -> "Аккумулятор"
+        MetricId.BATTERY_PERCENT -> "Заряд"
         MetricId.TEMPERATURE_CONTROLLER_C -> "Контроллер"
         MetricId.TEMPERATURE_MOS_C -> "Мосфеты"
         MetricId.TEMPERATURE_MOTOR_C -> "Мотор"
         MetricId.TEMPERATURE_BATTERY_C -> "Батарея"
-        MetricId.PITCH_DEG -> "Тангаж"
+        MetricId.PITCH_DEG -> "Наклон"
         MetricId.ROLL_DEG -> "Крен"
         MetricId.TRIP_DISTANCE_KM -> "Пробег"
         MetricId.TOTAL_DISTANCE_KM -> "Общий пробег"
@@ -85,6 +89,9 @@ object MetricSpeech {
     }
 
     private fun defaultNameEn(metric: MetricId): String = when (metric) {
+        MetricId.PHONE_GPS_SPEED_KMH, MetricId.DRAGY_SPEED_KMH, MetricId.DRAGY_SATELLITES,
+        MetricId.DRAGY_HACC_M, MetricId.DRAGY_HEADING_DEG, MetricId.DRAGY_ALT_M,
+        MetricId.DRAGY_FIX_TYPE, MetricId.DRAGY_BATTERY_PERCENT -> metric.displayName(isRu = false)
         MetricId.SPEED_KMH -> "Speed"
         MetricId.GPS_SPEED_KMH -> "GPS speed"
         MetricId.PWM_PERCENT -> "PWM"
@@ -92,6 +99,7 @@ object MetricSpeech {
         MetricId.CELL_VOLTAGE_AVG_V -> "Cell"
         MetricId.CELL_VOLTAGE_DELTA_V -> "Cell spread"
         MetricId.CURRENT_A -> "Current"
+        MetricId.BUS_CURRENT_A -> "Bus current"
         MetricId.PHASE_CURRENT_A -> "Phase current"
         MetricId.POWER_W -> "Power"
         MetricId.BATTERY_PERCENT -> "Battery"
@@ -107,42 +115,48 @@ object MetricSpeech {
     }
 
     private fun unitWordRu(metric: MetricId): UnitWord = when (metric) {
-        MetricId.SPEED_KMH, MetricId.GPS_SPEED_KMH ->
+        MetricId.DRAGY_HACC_M, MetricId.DRAGY_ALT_M -> UnitWord("метр", "метра", "метров")
+        MetricId.DRAGY_SATELLITES -> UnitWord("спутник", "спутника", "спутников")
+        MetricId.DRAGY_FIX_TYPE -> UnitWord("", "", "")
+        MetricId.SPEED_KMH, MetricId.GPS_SPEED_KMH, MetricId.PHONE_GPS_SPEED_KMH, MetricId.DRAGY_SPEED_KMH ->
             UnitWord("километр в час", "километра в час", "километров в час")
         MetricId.TRIP_DISTANCE_KM, MetricId.TOTAL_DISTANCE_KM ->
             UnitWord("километр", "километра", "километров")
-        MetricId.PWM_PERCENT, MetricId.BATTERY_PERCENT ->
+        MetricId.PWM_PERCENT, MetricId.BATTERY_PERCENT, MetricId.DRAGY_BATTERY_PERCENT ->
             UnitWord("процент", "процента", "процентов")
         MetricId.VOLTAGE_V, MetricId.CELL_VOLTAGE_AVG_V, MetricId.CELL_VOLTAGE_DELTA_V ->
             UnitWord("вольт", "вольта", "вольт")
-        MetricId.CURRENT_A, MetricId.PHASE_CURRENT_A ->
+        MetricId.CURRENT_A, MetricId.BUS_CURRENT_A, MetricId.PHASE_CURRENT_A ->
             UnitWord("ампер", "ампера", "ампер")
         MetricId.POWER_W ->
             UnitWord("ватт", "ватта", "ватт")
         MetricId.TEMPERATURE_CONTROLLER_C, MetricId.TEMPERATURE_MOS_C,
         MetricId.TEMPERATURE_MOTOR_C, MetricId.TEMPERATURE_BATTERY_C,
-        MetricId.PITCH_DEG, MetricId.ROLL_DEG ->
+        MetricId.PITCH_DEG, MetricId.ROLL_DEG, MetricId.DRAGY_HEADING_DEG ->
             UnitWord("градус", "градуса", "градусов")
         MetricId.TIRE_PRESSURE_BAR ->
             UnitWord("бар", "бара", "бар")
     }
 
     private fun unitWordEn(metric: MetricId): UnitWord = when (metric) {
-        MetricId.SPEED_KMH, MetricId.GPS_SPEED_KMH ->
+        MetricId.DRAGY_HACC_M, MetricId.DRAGY_ALT_M -> UnitWord("metre", "metres", "metres")
+        MetricId.DRAGY_SATELLITES -> UnitWord("satellite", "satellites", "satellites")
+        MetricId.DRAGY_FIX_TYPE -> UnitWord("", "", "")
+        MetricId.SPEED_KMH, MetricId.GPS_SPEED_KMH, MetricId.PHONE_GPS_SPEED_KMH, MetricId.DRAGY_SPEED_KMH ->
             UnitWord("kilometer per hour", "kilometers per hour", "kilometers per hour")
         MetricId.TRIP_DISTANCE_KM, MetricId.TOTAL_DISTANCE_KM ->
             UnitWord("kilometer", "kilometers", "kilometers")
-        MetricId.PWM_PERCENT, MetricId.BATTERY_PERCENT ->
+        MetricId.PWM_PERCENT, MetricId.BATTERY_PERCENT, MetricId.DRAGY_BATTERY_PERCENT ->
             UnitWord("percent", "percent", "percent")
         MetricId.VOLTAGE_V, MetricId.CELL_VOLTAGE_AVG_V, MetricId.CELL_VOLTAGE_DELTA_V ->
             UnitWord("volt", "volts", "volts")
-        MetricId.CURRENT_A, MetricId.PHASE_CURRENT_A ->
+        MetricId.CURRENT_A, MetricId.BUS_CURRENT_A, MetricId.PHASE_CURRENT_A ->
             UnitWord("amp", "amps", "amps")
         MetricId.POWER_W ->
             UnitWord("watt", "watts", "watts")
         MetricId.TEMPERATURE_CONTROLLER_C, MetricId.TEMPERATURE_MOS_C,
         MetricId.TEMPERATURE_MOTOR_C, MetricId.TEMPERATURE_BATTERY_C,
-        MetricId.PITCH_DEG, MetricId.ROLL_DEG ->
+        MetricId.PITCH_DEG, MetricId.ROLL_DEG, MetricId.DRAGY_HEADING_DEG ->
             UnitWord("degree", "degrees", "degrees")
         MetricId.TIRE_PRESSURE_BAR ->
             UnitWord("bar", "bar", "bar")

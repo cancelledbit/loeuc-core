@@ -13,6 +13,12 @@ fun LeaperKimTelemetry.toDeviceTelemetry(): DeviceTelemetry = DeviceTelemetry.of
     DeviceMetric.OutputCurrentA to outputCurrent,
     DeviceMetric.PhaseCurrentA to phaseCurrent,
     DeviceMetric.PowerW to power,
+    // Duty scales the product, exactly as it does for InMotion and Begode: the inverter puts
+    // roughly `bus voltage x duty` on the winding, so a bare `bus voltage x phase current`
+    // multiplies quantities from the two sides of the inverter and overstates the load by
+    // `1 / duty`. With no duty reading there is nothing to scale by, so the NaN filter in
+    // `DeviceTelemetry.of` drops the metric rather than assuming full duty.
+    DeviceMetric.ApparentPowerVa to voltage * phaseCurrent * pwmPercent / 100.0,
     DeviceMetric.ControllerTemperatureC to temperature,
     DeviceMetric.MosTemperatureC to mosTemperature,
     DeviceMetric.MotorTemperatureC to motorTemperature,

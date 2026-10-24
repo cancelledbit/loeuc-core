@@ -24,6 +24,7 @@ object MetricIdSources {
             DeviceMetric.OutputCurrentA,
             DeviceMetric.ChargeCurrentA,
         ),
+        MetricId.BUS_CURRENT_A to listOf(DeviceMetric.OutputCurrentA),
         MetricId.PHASE_CURRENT_A to listOf(DeviceMetric.PhaseCurrentA),
         MetricId.POWER_W to listOf(DeviceMetric.PowerW, DeviceMetric.ChargePowerW),
         MetricId.BATTERY_PERCENT to listOf(DeviceMetric.BatteryPercent),

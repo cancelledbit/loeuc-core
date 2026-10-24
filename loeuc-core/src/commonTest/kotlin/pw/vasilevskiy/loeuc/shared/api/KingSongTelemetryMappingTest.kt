@@ -31,7 +31,7 @@ class KingSongTelemetryMappingTest {
     fun onlyTheLiveTemperatureProbeFeedsTheMetric() {
         val telemetry = KingSongTelemetry(
             temperature = 42.0,
-            secondaryTemperature = 38.0,
+            motorTemperature = 38.0,
         ).toDeviceTelemetry()
 
         assertEquals(42.0, telemetry[DeviceMetric.ControllerTemperatureC])

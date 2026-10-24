@@ -80,6 +80,70 @@ class AlertCadenceTest {
     }
 
     @Test
+    fun testLastBeepsBeforeTheToneConvergeOnMinIntervalWhateverTheStartInterval() {
+        // The regression: the ramp ran over the full 0..1 and was cut off at the continuous
+        // point, so the last beeps sat at low + 0.1 * span - 265 ms from a 2 s start, 485 ms
+        // from a 4 s start. The start interval must only shape the start and the middle.
+        for (curve in AccelerationCurve.entries) {
+            val endIntervals = listOf(500L, 2000L, 4000L).map { start ->
+                val type = AlertType.Accelerating(
+                    minIntervalMs = 50L,
+                    maxIntervalMs = start,
+                    curve = curve,
+                    continuousFromRatio = 0.9,
+                )
+                val justBefore = AlertCadence.forProgress(type, 0.8999)
+                assertFalse(justBefore.continuous, "curve=$curve start=$start")
+                justBefore.intervalMs
+            }
+            for (interval in endIntervals) {
+                assertTrue(interval in 50L..55L, "end interval $interval, curve=$curve, all=$endIntervals")
+            }
+        }
+    }
+
+    @Test
+    fun testStartIntervalStillShapesTheBeginningOfTheRamp() {
+        val slow = pwmLike.copy(maxIntervalMs = 4000L)
+        val fast = pwmLike.copy(maxIntervalMs = 2000L)
+
+        assertEquals(4000L, AlertCadence.forProgress(slow, 0.0).intervalMs)
+        assertEquals(2000L, AlertCadence.forProgress(fast, 0.0).intervalMs)
+        assertTrue(AlertCadence.forProgress(slow, 0.3).intervalMs > AlertCadence.forProgress(fast, 0.3).intervalMs)
+    }
+
+    @Test
+    fun testIntervalIsInterpolatedOverTheBeepingPartOfTheRamp() {
+        // Linear, 50..450 ms, continuous from 0.95: halfway to the merge is halfway down.
+        val interval = AlertCadence.forProgress(pwmLike, 0.475).intervalMs
+        assertTrue(interval in 249L..250L, "interval=$interval")
+    }
+
+    @Test
+    fun testContinuousPointAtOrBeyondTheEdgesDoesNotBreakTheRamp() {
+        val neverMerges = pwmLike.copy(continuousFromRatio = 1.5)
+        assertEquals(450L, AlertCadence.forProgress(neverMerges, 0.0).intervalMs)
+        assertEquals(250L, AlertCadence.forProgress(neverMerges, 0.5).intervalMs)
+        assertEquals(50L, AlertCadence.forProgress(neverMerges, 1.0).intervalMs)
+        assertFalse(AlertCadence.forProgress(neverMerges, 1.0).continuous)
+
+        val mergesAtTheTop = pwmLike.copy(continuousFromRatio = 1.0)
+        assertEquals(250L, AlertCadence.forProgress(mergesAtTheTop, 0.5).intervalMs)
+        assertTrue(AlertCadence.forProgress(mergesAtTheTop, 1.0).continuous)
+
+        for (ratio in listOf(0.0, -1.0)) {
+            val alwaysContinuous = pwmLike.copy(continuousFromRatio = ratio)
+            val point = AlertCadence.forProgress(alwaysContinuous, 0.0)
+            assertTrue(point.continuous, "ratio=$ratio")
+            assertEquals(0L, point.intervalMs, "ratio=$ratio")
+        }
+
+        val notANumber = pwmLike.copy(continuousFromRatio = Double.NaN)
+        val point = AlertCadence.forProgress(notANumber, 0.5)
+        assertEquals(250L, point.intervalMs)
+    }
+
+    @Test
     fun testProgressIsClampedOutsideThresholds() {
         assertEquals(AlertCadence.forProgress(pwmLike, 0.0), AlertCadence.forProgress(pwmLike, -5.0))
         assertEquals(AlertCadence.forProgress(pwmLike, 1.0), AlertCadence.forProgress(pwmLike, 42.0))

@@ -22,8 +22,9 @@ sealed interface AlertType {
 
     /**
      * Repeats faster as the metric climbs: the period shrinks from [maxIntervalMs] to
-     * [minIntervalMs] across the condition band, and at the top of the curve the beeping
-     * merges into one continuous tone.
+     * [minIntervalMs] across the part of the condition band that ends at
+     * [continuousFromRatio], and from there the beeping merges into one continuous tone. The
+     * last beeps before the merge are always at [minIntervalMs], whatever [maxIntervalMs] is.
      *
      * @param pitchRiseRatio Multiplier applied to every frequency in the pattern at progress
      *   1.0; 1.0 leaves the pitch alone. A multiplier rather than an absolute ceiling: a

@@ -3,11 +3,21 @@ package pw.vasilevskiy.loeuc.shared.alerts
 import pw.vasilevskiy.loeuc.shared.alerts.model.AnnouncementComposer
 import pw.vasilevskiy.loeuc.shared.alerts.model.MetricId
 import pw.vasilevskiy.loeuc.shared.alerts.model.MetricSpeech
+import pw.vasilevskiy.loeuc.shared.alerts.model.SpokenAnnouncement
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class AnnouncementComposerTest {
+
+    @Test
+    fun blank_stored_phrase_speaks_the_same_default_as_the_editor_preview() {
+        val announcement = SpokenAnnouncement(
+            "speed", " ", MetricId.SPEED_KMH, 60.0,
+        )
+        assertEquals("Скорость 60", announcement.text(isRu = true))
+        assertEquals("Speed 60", announcement.text(isRu = false))
+    }
 
     private fun ru(template: String, metric: MetricId, value: Double) =
         AnnouncementComposer.compose(template, metric, value, isRu = true)
@@ -160,10 +170,13 @@ class AnnouncementComposerTest {
                     MetricSpeech.unitTokens.none { phrase.contains(it) },
                     "$metric default phrase speaks its unit (isRu=$isRu): $phrase"
                 )
-                assertTrue(
-                    MetricSpeech.unitFor(metric, 2.0, isRu).isNotBlank(),
-                    "$metric has no unit word (isRu=$isRu)"
-                )
+                val unit = MetricSpeech.unitFor(metric, 2.0, isRu)
+                if (metric == MetricId.DRAGY_FIX_TYPE) {
+                    // GNSS fix type is a category code, with no physical unit.
+                    assertEquals("", unit)
+                } else {
+                    assertTrue(unit.isNotBlank(), "$metric has no unit word (isRu=$isRu)")
+                }
             }
         }
     }

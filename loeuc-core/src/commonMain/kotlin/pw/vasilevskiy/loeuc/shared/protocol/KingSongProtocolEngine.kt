@@ -10,17 +10,47 @@ data class KingSongTelemetry(
     val power: Double = Double.NaN,
     val apparentPower: Double = Double.NaN,
     /**
-     * Live temperature, taken from the `0xB9` sensor because that is the one that actually
-     * tracks the ride. See [secondaryTemperature] for why they are kept apart.
+     * Live temperature, from the `0xA9` sensor - the one that answers "how hot is the
+     * controller".
+     *
+     * `0xA9[12..13]` and `0xB9[14..15]` are two *different* sensors, both arriving at ~2 Hz;
+     * writing them into one field made the reading flip between them several times a second.
+     * Which of the two is the live one was decided the wrong way round until 2026-09-14, and
+     * two independent sources now say `0xA9`:
+     *
+     * - WheelLog, the project's reference implementation, publishes `0xA9[12..13]` as the
+     *   wheel's temperature and `0xB9[14..15]` only as a secondary reading.
+     * - A KSN-S18Pro+ capture taken from a cold standstill (`loeuc_CD3430395851_...jsonl`,
+     *   1166 live frames) settles it physically: both sensors sit at ambient 16-17 C for the
+     *   first five minutes of standing, and then, over ~70 s of riding, `0xA9` climbs
+     *   17 -> 24 C while `0xB9` lags at 17 -> 21 C. Seven degrees in a minute is a power stage
+     *   heating up; nothing else in a wheel moves that fast.
+     *
+     * The earlier reading of an S22 capture concluded the opposite, but that wheel was already
+     * warm when the capture started (both sensors within a degree of each other for its whole
+     * three minutes), so it could not separate them.
      */
     val temperature: Double = Double.NaN,
     /**
-     * The `0xA9` temperature sensor. `0xA9` and `0xB9` are two *different* sensors and both
-     * arrive at ~2 Hz, so writing them into a single field made the reading flip between them
-     * several times a second — on an S22 capture the value alternated on 290 of 517 updates
-     * with a 4 C swing. They now live in separate fields.
+     * Motor temperature, `0xB9[14..15]`, the slower of the brand's two probes.
+     *
+     * Three independent readings agree, which is what the repository asks for before a field
+     * gets a name:
+     *
+     * - the stock KingSong app shows two temperatures and calls this one the motor, reported
+     *   by an S22 owner on 2026-09-14;
+     * - the physics match. On the cold-start S18 Pro+ capture this probe climbs 17 -> 21 C
+     *   over the same 70 s in which [temperature] goes 17 -> 24 C. A motor has far more
+     *   thermal mass than a power stage, so it heats and cools slower - which is exactly the
+     *   lag seen here;
+     * - WheelLog keeps it in its own slot rather than the wheel's main temperature.
+     *
+     * An earlier pass through this file called it "the second sensor, purpose unknown" and
+     * concluded the brand has no motor probe at all. That was a conclusion drawn from "we do
+     * not know", which is not the same thing as "there is none" - and the owner of the wheel
+     * knew.
      */
-    val secondaryTemperature: Double = Double.NaN,
+    val motorTemperature: Double = Double.NaN,
     /** Output/duty from `0xF5`, percent. */
     val pwmPercent: Double = Double.NaN,
     /** Speed ceiling the wheel is currently enforcing, from `0xF6`, km/h. */
@@ -81,11 +111,6 @@ class KingSongProtocolEngine {
     private var buffer = byteArrayOf()
     private var state = KingSongTelemetry()
 
-    /**
-     * Wheels that never send `0xB9` would otherwise report no temperature at all, so the
-     * `0xA9` sensor stands in until the first `0xB9` frame arrives and then steps aside.
-     */
-    private var sawRideStatsTemperature = false
     private var identity = KingSongIdentity()
 
     private val bmsPages = KingSongBmsPages()
@@ -115,7 +140,6 @@ class KingSongProtocolEngine {
     fun reset() {
         buffer = byteArrayOf()
         state = KingSongTelemetry()
-        sawRideStatsTemperature = false
         identity = KingSongIdentity()
         bmsPages.clear()
         settingsTracker.clear()
@@ -223,8 +247,7 @@ class KingSongProtocolEngine {
                     phaseCurrent = current, // KingSong reports phase current
                     power = voltage * current,
                     apparentPower = voltage * current,
-                    secondaryTemperature = temperature,
-                    temperature = if (sawRideStatsTemperature) state.temperature else temperature,
+                    temperature = temperature,
                     totalDistanceKm = totalDistance,
                     rideMode = rideMode,
                     lastCommand = frame.command(),
@@ -251,11 +274,10 @@ class KingSongProtocolEngine {
             }
 
             frame.isStandardKingSongFrame() && frame.command() == KINGSONG_COMMAND_RIDE_STATS -> {
-                sawRideStatsTemperature = true
                 state.copy(
                     tripDistanceMeters = frame.kingSongDistance(offset = 2).toDouble(),
                     rideTimeSeconds = frame.int16Le(offset = 6).toDouble(),
-                    temperature = frame.int16Le(offset = 14) / 100.0,
+                    motorTemperature = frame.int16Le(offset = 14) / 100.0,
                     // WheelLog and the official app agree on both bytes; the app shows any
                     // non-zero fan byte as "cooling" and treats a charging byte of 1 as charging.
                     fanRunning = frame.u8(12) != 0,
@@ -442,9 +464,12 @@ data class KingSongBmsPack(
     val chargePercent: Double?
         get() {
             reportedChargePercent?.let { return it.coerceIn(0.0, 100.0) }
-            val full = fullAh?.takeIf { it > 0.0 } ?: return null
-            val remaining = remainingAh ?: return null
-            return (remaining / full * 100.0).coerceIn(0.0, 100.0)
+            val full = fullAh?.takeIf { it > 0.0 }
+            val remaining = remainingAh
+            if (full != null && remaining != null) return (remaining / full * 100.0).coerceIn(0.0, 100.0)
+            // A pack that states neither still reports its cells, and they are the pack itself.
+            if (cells.isEmpty()) return null
+            return CellChargeCurve.percentFromCellVoltage(cells.average())
         }
 
     val hasData: Boolean
@@ -516,8 +541,9 @@ internal class KingSongBmsPages {
  *   100` Ah at +11, two environment temperatures `i16le / 10` C at +14 and +16, and two
  *   humidity readings `u16le / 10` % at +18 and +20.
  *
- * Validated only by closure on WheelLog's F22P and F18P test captures: the cells sum to within
- * 0.05 V of the voltage the same frame reports. No capture of our own exists.
+ * Validated by closure on WheelLog's F22P and F18P test captures, where the cells sum to within
+ * 0.05 V of the voltage the same frame reports, and on a KS-14D Pro capture of our own, which
+ * uses the same frame on a 16-cell pack but leaves charge, cycles and capacity at zero.
  */
 private fun readKingSongExtendedBmsPack(index: Int, frame: ByteArray): KingSongBmsPack? {
     val cellCountOffset = KINGSONG_FRAME_SIZE + 1
@@ -539,8 +565,14 @@ private fun readKingSongExtendedBmsPack(index: Int, frame: ByteArray): KingSongB
     for (sensor in 0 until temperatureCount) {
         temperatures.addKingSongBmsTemperature(frame.uint16Le(temperatureCountOffset + 1 + sensor * 2))
     }
-    val chargePercent = frame.uint16Le(tail + 4) / 10.0
-    val factoryAh = frame.uint16Le(tail + 11) / 100.0
+    val rawChargePermille = frame.uint16Le(tail + 4)
+    val rawFactoryCentiAh = frame.uint16Le(tail + 11)
+    // The KS-14D Pro fills cells, temperatures, current and voltage but leaves charge, cycles
+    // and capacity at zero. A real pack never has zero capacity, so that pair means "not
+    // reported", and the charge is then read off the cells instead.
+    val statesCharge = rawChargePermille != 0 || rawFactoryCentiAh != 0
+    val chargePercent = rawChargePermille / 10.0
+    val factoryAh = rawFactoryCentiAh / 100.0
     val environmentTemperatures = mutableListOf<Double>()
     val environmentHumidity = mutableListOf<Double>()
     for (sensor in 0..1) {
@@ -556,12 +588,12 @@ private fun readKingSongExtendedBmsPack(index: Int, frame: ByteArray): KingSongB
         index = index,
         voltage = frame.uint16Le(tail + 2) / 100.0,
         currentAmps = frame.int16Le(tail) / 100.0,
-        remainingAh = factoryAh * chargePercent / 100.0,
-        factoryAh = factoryAh,
-        chargeCycles = frame.uint16Le(tail + 9),
+        remainingAh = if (statesCharge) factoryAh * chargePercent / 100.0 else null,
+        factoryAh = if (statesCharge) factoryAh else null,
+        chargeCycles = if (statesCharge) frame.uint16Le(tail + 9) else null,
         cells = cells,
         temperatures = temperatures,
-        reportedChargePercent = chargePercent,
+        reportedChargePercent = if (statesCharge) chargePercent else null,
         environmentTemperatures = environmentTemperatures,
         environmentHumidity = environmentHumidity,
     )

@@ -47,6 +47,15 @@ data class InmotionTelemetry(
     val batteryMaxBmsTemperature: Double = Double.NaN,
     val motorEnabled: Double = Double.NaN,
     val charging: Double = Double.NaN,
+    /**
+     * The trip maxima the wheel keeps for itself: top speed, battery power and motor power.
+     * Only the P6's integrated realtime answer (`0x87`) carries them; NaN until one arrives.
+     */
+    val wheelMaxSpeedKmh: Double = Double.NaN,
+    val wheelMaxPowerW: Double = Double.NaN,
+    val wheelMaxMotorPowerW: Double = Double.NaN,
+    /** Signal strength of the wheel's own LTE modem, as the `0x87` answer reports it. */
+    val lteSignal: Double = Double.NaN,
 )
 
 data class InmotionProtocolUpdate(
@@ -74,6 +83,24 @@ data class InmotionBmsBattery(
     val dischargeCurrent: Double,
     val hasFault: Boolean,
     val rawData: ByteArray = byteArrayOf(),
+    /**
+     * Per-cell voltages, and the pack's own temperature sensors, from the direct BMS reads.
+     *
+     * Empty until a pack has answered one: the plain `0x05` battery frame carries neither,
+     * and on the models that answer nothing at all they stay empty for the whole session.
+     */
+    val cells: List<Double> = emptyList(),
+    val temperatures: List<InmotionBmsTemperature> = emptyList(),
+    /** Everything else the pack's own BMS reported about itself, or null if it has not. */
+    val direct: InmotionDirectBmsRealtime? = null,
+    /**
+     * False for a pack that exists only because its BMS answered a direct read.
+     *
+     * The four state flags above come from the `0x05` battery frame and have no meaning
+     * without it. A consumer that shows them has to be able to tell "the wheel says no
+     * fault" from "nobody asked", which a hardcoded `false` would hide.
+     */
+    val reported: Boolean = true,
 )
 
 data class InmotionBmsSnapshot(
@@ -111,6 +138,13 @@ data class InmotionSettingCapability(
     val maxValue: Int,
     /** `"toggle"`, `"slider"` or [KIND_READONLY] - fields we can decode but must not write. */
     val kind: String,
+    /**
+     * How the value reads when it is not a plain number - `0x12` for a raw byte, `ON` for a
+     * status bit. Null on every named field, whose wording is the platform formatter's.
+     */
+    val valueTextEn: String? = null,
+    val valueTextRu: String? = null,
+    val step: Int = 1,
 )
 
 /**
@@ -136,17 +170,71 @@ class InmotionProtocolEngine {
     private var buffer = byteArrayOf()
     private var modelId: Int? = null
     private var settings = emptyList<InmotionSettingCapability>()
+    private val p6ChargingCommands = InmotionP6ChargingCommands()
+
+    /** The last settings answer of either read, kept for [settingsBlockRows]. */
+    private var settingsPayload: ByteArray? = null
+    private var settingsPayloadOffset = 0
+
+    /**
+     * The frames the diagnostics report quotes, kept as they arrived: the last realtime-error
+     * answer, the last `0x05` battery answer of any model, and the last direct BMS answer per
+     * source address and selector.
+     */
+    private var errorFrame: ByteArray? = null
+    private var errorSnapshot: InmotionDiagnosticsSnapshot? = null
+    private var batteryFrame: ByteArray? = null
+    private var batteryPayload: ByteArray? = null
+    private val directReadFrames = mutableMapOf<Pair<Int, Int>, InmotionDirectBmsResponse>()
     private var mainBoardVersion: InmotionMainBoardVersion? = null
+
+    /** Odometer from the latest total-statistics answer, meters; NaN until one arrives. */
+    private var totalDistanceMeters = Double.NaN
+
+    /**
+     * The last realtime reading, before the odometer and the `0x87` extras are attached. The
+     * P6's integrated realtime answer lays its own fields over it, because that answer lacks
+     * the angles, most temperatures and the state byte the `0x04` frame carries.
+     */
+    private var lastRealtime: InmotionTelemetry? = null
+
+    /** What only the `0x87` answer carries, kept so every later reading carries it too. */
+    private var integratedExtras: IntegratedRealtimeExtras? = null
+
+    /**
+     * What the last `0x05` battery answer said, kept rather than published and forgotten.
+     *
+     * The direct BMS answers arrive in their own frames, often a second apart from the `0x05`
+     * one, and each half is useless alone: the battery frame has the pack state and no cells,
+     * a direct answer has cells and no state. Holding both is what lets either arrival publish
+     * a complete snapshot instead of one that blinks between halves.
+     */
+    private var batterySlots = emptyList<InmotionBmsBattery>()
+    private val directRealtime = mutableMapOf<Int, InmotionDirectBmsRealtime>()
+    private val directCells = mutableMapOf<Int, List<Double>>()
 
     fun reset() {
         buffer = byteArrayOf()
         modelId = null
         settings = emptyList()
+        settingsPayload = null
+        settingsPayloadOffset = 0
+        errorFrame = null
+        errorSnapshot = null
+        batteryFrame = null
+        batteryPayload = null
+        directReadFrames.clear()
         mainBoardVersion = null
+        totalDistanceMeters = Double.NaN
+        lastRealtime = null
+        integratedExtras = null
+        batterySlots = emptyList()
+        directRealtime.clear()
+        directCells.clear()
     }
 
     fun mainInfoCommand(): ByteArray =
-        buildMessage(flag = FLAG_INITIAL, command = COMMAND_MAIN_INFO, data = byteArrayOf(0x01))
+        buildInmotionV2Message(flag = FLAG_INITIAL, command = COMMAND_MAIN_INFO, data = byteArrayOf(0x01))
 
     /**
      * Same `0x02` main-info command as [mainInfoCommand], different selector: `data = {0x06}`
@@ -156,13 +244,46 @@ class InmotionProtocolEngine {
      * distinguishes them on the wire.
      */
     fun versionInfoCommand(): ByteArray =
-        buildMessage(flag = FLAG_INITIAL, command = COMMAND_MAIN_INFO, data = byteArrayOf(0x06))
+        buildInmotionV2Message(flag = FLAG_INITIAL, command = COMMAND_MAIN_INFO, data = byteArrayOf(0x06))
+
+    /**
+     * The P6 integrated realtime read (`0x07`), also asked of an X1, or null for any other model
+     * or before main info has named it.
+     *
+     * The official app polls it next to `0x04`. The answer repeats the realtime values, so
+     * asking for both doubles how often speed, PWM and the rest refresh, and it adds the
+     * wheel's own trip maxima and LTE signal, which no other answer has. A read, not a write.
+     */
+    fun integratedRealtimeCommand(): ByteArray? {
+        if (modelId !in P6_READ_MODELS) return null
+        return buildInmotionV2Message(flag = FLAG_DEFAULT, command = COMMAND_INTEGRATED_REALTIME, data = byteArrayOf())
+    }
 
     fun realtimeCommand(): ByteArray =
-        buildMessage(flag = FLAG_DEFAULT, command = COMMAND_REALTIME, data = byteArrayOf())
+        buildInmotionV2Message(flag = FLAG_DEFAULT, command = COMMAND_REALTIME, data = byteArrayOf())
+
+    /**
+     * The total-statistics read (`0x11`), whose answer carries the odometer - the only place a
+     * V2 wheel reports one; no realtime layout has it. Null until main info has named the model.
+     *
+     * P6 included: in the official app `P6StatisticsTotalData.fromBytes` and `toMap` are
+     * instruction-for-instruction the V11 ones (five u32 LE from `@0`: mileage, consumption,
+     * recovery, ride time, power-on time), and `P6Cmd` overrides nothing in `LorinCmd`, so the
+     * request id is the V11 one too - the same one WheelLog sends a V11.
+     *
+     * Both reference clients ask for it all session long: WheelLog alternates it with the
+     * realtime read in its keep-alive loop, and the official app's `requestVehicleData` chain
+     * asks for it every round. WheelLog's ride distance is this odometer minus its first reading
+     * of the session - which is why a V11 whose realtime trip reads zero still shows mileage
+     * there. It is a read, not a write: nothing on the wheel changes by answering it.
+     */
+    fun totalStatsCommand(): ByteArray? {
+        if (modelId == null) return null
+        return buildInmotionV2Message(flag = FLAG_DEFAULT, command = COMMAND_TOTAL_STATS, data = byteArrayOf())
+    }
 
     fun settingsCommand(): ByteArray =
-        buildMessage(flag = FLAG_DEFAULT, command = COMMAND_SETTINGS, data = byteArrayOf())
+        buildInmotionV2Message(flag = FLAG_DEFAULT, command = COMMAND_SETTINGS, data = byteArrayOf())
 
     /**
      * P6 does not answer the `0x08` settings read at all - no `0x88` response appears in
@@ -181,7 +302,7 @@ class InmotionProtocolEngine {
      * answered. See [encodeLorinCommand] for where the second byte comes from.
      */
     fun settingsAllCommand(): ByteArray =
-        buildMessage(flag = FLAG_DEFAULT, command = COMMAND_SETTINGS_ALL, data = byteArrayOf())
+        buildInmotionV2Message(flag = FLAG_DEFAULT, command = COMMAND_SETTINGS_ALL, data = byteArrayOf())
 
     /**
      * The reads to send after a write so the screen shows what the wheel applied rather than
@@ -203,6 +324,26 @@ class InmotionProtocolEngine {
 
     fun settingsCapabilities(): List<InmotionSettingCapability> = settings
 
+    /**
+     * Display-only rows of the last settings block - see [InmotionSettingsBlockRows]. Empty
+     * until a settings answer arrives. Their `sourceOffset` indexes the frame, not the payload.
+     */
+    fun settingsBlockRows(): List<InmotionSettingCapability> {
+        val payload = settingsPayload ?: return emptyList()
+        return InmotionSettingsBlockRows.rows(
+            modelId = modelId,
+            payload = payload,
+            payloadOffset = settingsPayloadOffset,
+            hasNamedFields = settings.isNotEmpty(),
+        )
+    }
+
+    /**
+     * Index in the frame of the first byte of the last settings block; add it to a named
+     * capability's `sourceOffset` to point at the byte a capture shows. Zero before any block.
+     */
+    fun settingsBlockFrameOffset(): Int = settingsPayloadOffset
+
     /** Canonical model hint for platform battery-catalogue lookup; null until main info arrives. */
     fun modelName(): String? = when (modelId) {
         MODEL_V11 -> "V11"
@@ -214,6 +355,7 @@ class InmotionProtocolEngine {
         111 -> "V12S"
         121 -> "V9"
         MODEL_P6 -> "P6"
+        MODEL_X1 -> "X1"
         else -> null
     }
 
@@ -229,11 +371,21 @@ class InmotionProtocolEngine {
         if (capability.kind == KIND_READONLY) {
             return null
         }
-        if (value !in capability.minValue..capability.maxValue) {
+        if (value !in capability.minValue..capability.maxValue ||
+            (value - capability.minValue) % capability.step != 0
+        ) {
             return null
         }
         fun otherValue(otherKey: String) = settings.firstOrNull { it.key == otherKey }?.rawValue ?: 0
         return when (key) {
+            InmotionP6ChargingCommands.ChargeCutoffKey,
+            InmotionP6ChargingCommands.Ac220Key,
+            InmotionP6ChargingCommands.Ac110Key ->
+                p6ChargingCommands.build(
+                    key, value,
+                    settings.firstOrNull { it.key == InmotionP6ChargingCommands.Ac220Key }?.rawValue,
+                    settings.firstOrNull { it.key == InmotionP6ChargingCommands.Ac110Key }?.rawValue,
+                )
             KEY_AUTO_LIGHT_STATE ->
                 buildControlCommand(0x2F, byteArrayOf(value.toByte()))
             KEY_RIDE_MODE ->
@@ -396,30 +548,21 @@ class InmotionProtocolEngine {
     }
 
     fun bmsRealtimeCommand(): ByteArray? =
-        if (modelId == MODEL_P6) {
-            buildMessage(flag = FLAG_DEFAULT, command = COMMAND_BATTERY_REALTIME, data = byteArrayOf())
+        if (modelId in P6_READ_MODELS) {
+            buildInmotionV2Message(flag = FLAG_DEFAULT, command = COMMAND_BATTERY_REALTIME, data = byteArrayOf())
         } else {
             null
         }
 
     fun bmsReadCommands(): List<ByteArray> {
-        if (modelId != MODEL_P6) {
+        if (modelId !in P6_READ_MODELS) {
             return emptyList()
         }
         return buildList {
             add(bmsRealtimeCommand()!!)
-            DIRECT_BMS_ADDRESSES.forEach { address ->
-                DIRECT_BMS_SELECTORS.forEach { selector ->
-                    // cmd byte carries no 0x80: that bit marks a write. The target
-                    // goes on the wire unshifted - TargetDeviceType stores 0x24..0x27
-                    // directly. See buildInmotionDirectReadMessage for the derivation.
-                    add(
-                        buildMessage(
-                            flag = FLAG_MANY_TO_MANY,
-                            command = 0x02,
-                            data = byteArrayOf(address.toByte(), selector.toByte()),
-                        ),
-                    )
+            InmotionDirectBms.ADDRESSES.forEach { address ->
+                InmotionDirectBms.SELECTORS.forEach { selector ->
+                    add(InmotionDirectBms.readCommand(address, selector))
                 }
             }
         }
@@ -494,8 +637,15 @@ class InmotionProtocolEngine {
         if (!frame.isValidV2Frame()) {
             return
         }
+        // A BMS, the TBox, or a frame not addressed to the app: none of them is a main-board
+        // answer, so none of the command branches below may read it. Only a BMS answer is
+        // decoded, and its source address goes into the bookkeeping as before.
+        if (InmotionV2Frames.mainBoardCommandIndex(frame) == null) {
+            decodeDirectBmsFrame(frame, accumulator)
+            return
+        }
 
-        val command = frame.u8(4) and 0x7F
+        val command = frame.u8(frame.v2CommandIndex()) and 0x7F
         val data = frame.v2Data()
         if (command == COMMAND_MAIN_INFO) {
             // The version block answers on this same command byte (see
@@ -504,6 +654,10 @@ class InmotionProtocolEngine {
             // keeps that null from clobbering an already-known modelId back to unknown.
             data.modelId()?.let { modelId = it }
             data.toMainBoardVersion()?.let { mainBoardVersion = it }
+        }
+        if (command == COMMAND_SETTINGS || command == COMMAND_SETTINGS_ALL) {
+            settingsPayload = data
+            settingsPayloadOffset = frame.v2CommandIndex() + frame.v2CommandSize()
         }
         if (command == COMMAND_SETTINGS) {
             settings = when {
@@ -534,27 +688,250 @@ class InmotionProtocolEngine {
             parsed.takeIf { it.isNotEmpty() }?.let { settings = it }
         }
         accumulator.commands += command
-        if (command == COMMAND_REALTIME) {
-            data.toTelemetry(modelId)?.let { accumulator.telemetry = it }
+        if (command == COMMAND_TOTAL_STATS) {
+            data.totalDistanceMeters()?.let { totalDistanceMeters = it }
         }
-        if (command == COMMAND_BATTERY_REALTIME && modelId == MODEL_P6) {
-            data.toP6BmsSnapshot()?.let { accumulator.bms = it }
+        if (command == COMMAND_REALTIME) {
+            data.toTelemetry(modelId)?.let {
+                lastRealtime = it
+                accumulator.telemetry = withStoredExtras(it)
+            }
+        }
+        if (command == COMMAND_INTEGRATED_REALTIME && modelId in P6_READ_MODELS &&
+            data.size >= P6_INTEGRATED_REALTIME_MIN_SIZE
+        ) {
+            integratedExtras = data.toIntegratedRealtimeExtras()
+            lastRealtime?.let { previous ->
+                val overlaid = data.overlayIntegratedRealtime(previous)
+                lastRealtime = overlaid
+                accumulator.telemetry = withStoredExtras(overlaid)
+            }
+        }
+        if (command == COMMAND_BATTERY_REALTIME && modelId in P6_READ_MODELS) {
+            data.toBmsBatteries(filterEmpty = true)
+                .takeIf { it.isNotEmpty() }
+                ?.let { batterySlots = it }
+            bmsSnapshot()?.let { accumulator.bms = it }
+        }
+        if (command == COMMAND_BATTERY_REALTIME) {
+            batteryFrame = frame.copyOf()
+            batteryPayload = data
         }
         if (command == COMMAND_REALTIME_ERROR) {
-            data.toDiagnosticsSnapshot()?.let { accumulator.diagnostics = it }
+            val snapshot = data.toDiagnosticsSnapshot()
+            accumulator.diagnostics = snapshot
+            errorFrame = frame.copyOf()
+            errorSnapshot = snapshot
         }
+    }
+
+    /**
+     * A many-to-many frame that is not the main board answering: a direct BMS answer is
+     * decoded, anything else is dropped. The source address still goes into the update's
+     * commands, as it always has, so a chunk holding only a BMS answer is reported at all.
+     */
+    private fun decodeDirectBmsFrame(frame: ByteArray, accumulator: FrameAccumulator) {
+        val response = InmotionDirectBms.response(frame) ?: return
+        accumulator.commands += frame.u8(4) and 0x7F
+        directReadFrames[response.sourceAddress to response.selector] = response
+        when (response.selector) {
+            InmotionDirectBms.SELECTOR_REALTIME ->
+                InmotionDirectBms.realtime(response.payload)?.let {
+                    directRealtime[response.sourceAddress] = it
+                }
+            InmotionDirectBms.SELECTOR_CELLS ->
+                InmotionDirectBms.cells(response.payload)
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { directCells[response.sourceAddress] = it }
+            else -> Unit
+        }
+        bmsSnapshot()?.let { accumulator.bms = it }
+    }
+
+    /**
+     * Every slot of the last `0x05` battery answer, empty ones included, for the diagnostics
+     * screen: a slot the wheel lists as absent is part of what that screen is for. Empty until
+     * a battery answer arrives. Not limited to a P6 - the slots are decoded for whichever
+     * model answered the read.
+     */
+    fun batteryDiagnostics(): List<WheelBatteryDiagnostic> =
+        batteryPayload?.toBmsBatteries(filterEmpty = false).orEmpty().map { battery ->
+            WheelBatteryDiagnostic(
+                index = battery.index,
+                detected = battery.detected,
+                enabled = battery.enabled,
+                charging = battery.charging,
+                voltage = battery.voltage,
+                chargeCurrent = battery.chargeCurrent,
+                dischargeCurrent = battery.dischargeCurrent,
+                hasFault = battery.hasFault,
+                hexData = battery.rawData.joinToString(" ") { byte ->
+                    (byte.toInt() and 0xFF).toString(16).uppercase().padStart(2, '0')
+                },
+            )
+        }
+
+    /**
+     * The diagnostics report for what this engine has received - see
+     * [InmotionDiagnosticsReport]. Null until a realtime-error answer has arrived, because
+     * without one there is nothing to report. A live engine keeps no per-frame clock, so the
+     * direct BMS answers are listed without a timestamp.
+     */
+    fun diagnosticsReportText(deviceName: String, deviceAddress: String, timestampMillis: Long): String? {
+        val frame = errorFrame ?: return null
+        val snapshot = errorSnapshot ?: return null
+        return InmotionDiagnosticsReport.text(
+            deviceName = deviceName,
+            deviceAddress = deviceAddress,
+            timestampMillis = timestampMillis,
+            command = snapshot.command,
+            errorCode = snapshot.errorCode,
+            payload = snapshot.payload,
+            rawFrame = frame,
+            items = snapshot.decodedItems,
+            batteryPayload = batteryPayload,
+            batteryRawFrame = batteryFrame,
+            directReads = directReadFrames.values.map { response ->
+                InmotionDiagnosticsReportDirectRead(
+                    sourceAddress = response.sourceAddress,
+                    targetAddress = response.targetAddress,
+                    selector = response.selector,
+                    timestampMillis = null,
+                    payload = response.payload,
+                    rawFrame = response.rawFrame,
+                )
+            },
+        )
+    }
+
+    /** Attaches the latest odometer answer and `0x87` extras, if any, to a realtime reading. */
+    private fun withStoredExtras(telemetry: InmotionTelemetry): InmotionTelemetry {
+        val withOdometer = if (totalDistanceMeters.isFinite()) {
+            telemetry.copy(totalDistanceMeters = totalDistanceMeters)
+        } else {
+            telemetry
+        }
+        val extras = integratedExtras ?: return withOdometer
+        return withOdometer.copy(
+            wheelMaxSpeedKmh = extras.maxSpeedKmh,
+            wheelMaxPowerW = extras.maxPowerW,
+            wheelMaxMotorPowerW = extras.maxMotorPowerW,
+            lteSignal = extras.lteSignal,
+        )
+    }
+
+    private class IntegratedRealtimeExtras(
+        val maxSpeedKmh: Double,
+        val maxPowerW: Double,
+        val maxMotorPowerW: Double,
+        val lteSignal: Double,
+    )
+
+    /**
+     * The P6 integrated realtime answer (`0x87`), after `P6IntegratedRealtimeInfo.fromBytes`
+     * and the `LorinIntegratedRealtimeInfo.fromBytes` it calls in the official app.
+     *
+     * A two-byte `data_format` (1 on every answer seen) comes first, then the `0x04` fields
+     * in the `0x04` order - which puts them two bytes later than there - up to motor power.
+     * After that the order is its own: charge levels, range and speed thresholds, three of the
+     * nine temperatures, the LTE signal, the trip maxima, trip and lifetime counters, and tire
+     * pressure at `@80`. Every field both answers carry was checked against the `0x04` frame
+     * next to it in `loeuc_E17CC2C97F8B_unknown_20260922_015443.jsonl` (175 answers): the slow
+     * ones agree to the byte, the fast ones within what the ride moved in the ~200 ms between
+     * the two.
+     */
+    private fun ByteArray.toIntegratedRealtimeExtras() = IntegratedRealtimeExtras(
+        maxSpeedKmh = uint16Le(36) / 100.0,
+        maxPowerW = uint16Le(38).toDouble(),
+        maxMotorPowerW = uint16Le(40).toDouble(),
+        lteSignal = u8(35).toDouble(),
+    )
+
+    /** [previous] with every field the `0x87` answer carries replaced by its value there. */
+    private fun ByteArray.overlayIntegratedRealtime(previous: InmotionTelemetry): InmotionTelemetry {
+        val current = int16Le(4) / 100.0
+        val rideBatteryPercent = uint16Le(24) / 100.0
+        val estimatedRangeKm = uint16Le(26) / 100.0
+        return previous.copy(
+            voltage = uint16Le(2) / 100.0,
+            batteryCurrent = current,
+            phaseCurrent = current,
+            // Tenths, as in the `0x04` frame - see `toV14FamilyTelemetry`.
+            chargeVoltage = uint16Le(6) / 10.0,
+            chargeCurrent = int16Le(8) / 100.0,
+            speedKmh = int16Le(10) / 100.0,
+            acceleration = int16Le(12) / 100.0,
+            torque = int16Le(14) / 100.0,
+            pwmPercent = pwmPercent(16),
+            power = int16Le(18).toDouble(),
+            motorPower = int16Le(20).toDouble(),
+            batteryPercent = uint16Le(22).div(100.0).coerceIn(0.0, 100.0),
+            rideBatteryPercent = rideBatteryPercent,
+            estimatedRangeKm = estimatedRangeKm,
+            remainingRangeKm = rideBatteryPercent * estimatedRangeKm / 100.0,
+            speedTiltBackKmh = uint16Le(28) / 100.0,
+            speedWarningKmh = uint16Le(30) / 100.0,
+            mosTemperature = presentTemperature(32),
+            motorTemperature = presentTemperature(33, zeroIsPresent = true),
+            boardTemperature = presentTemperature(34),
+            tripDistanceMeters = uint16Le(42) * 10.0,
+            // A model whose `0x04` frame has no tire pressure has none here either: the X1 field
+            // reads zero, and zero bar is not a reading.
+            tirePressureBar = if (previous.tirePressureBar.isNaN()) Double.NaN else uint16Le(80) / 100.0,
+        )
     }
 
     fun decodeBatteryDiagnostics(payload: ByteArray): List<InmotionBmsBattery> {
         return payload.toBmsBatteries(filterEmpty = false)
     }
 
-    private fun ByteArray.toP6BmsSnapshot(): InmotionBmsSnapshot? {
-        val batteries = toBmsBatteries(filterEmpty = true)
+    /**
+     * Everything known about the battery right now, or null while nothing has answered.
+     *
+     * Where a pack's own BMS has answered, it is the one that counts: the direct answers are
+     * what the pack measured, the `0x05` frame is the wheel's summary of it. Slots are paired
+     * with BMS addresses by position, because the wire gives no other link between the two -
+     * the first address that answers is the first slot the `0x05` frame lists, which is also
+     * the order a rider sees the packs numbered.
+     */
+    fun bmsSnapshot(): InmotionBmsSnapshot? {
+        val addresses = (directRealtime.keys + directCells.keys).sorted()
+        val batteries = if (addresses.isEmpty()) {
+            batterySlots
+        } else {
+            addresses.mapIndexed { index, address ->
+                val realtime = directRealtime[address]
+                val slot = batterySlots.getOrNull(index)
+                    // A pack whose BMS answered before the wheel's own battery frame did - or
+                    // instead of it, which a P6 does often enough that waiting for it once cost
+                    // the whole cell grid. NaN is this engine's "not reported".
+                    ?: InmotionBmsBattery(
+                        index = index + 1,
+                        detected = false,
+                        enabled = false,
+                        charging = false,
+                        voltage = Double.NaN,
+                        chargeCurrent = Double.NaN,
+                        dischargeCurrent = Double.NaN,
+                        hasFault = false,
+                        reported = false,
+                    )
+                slot.copy(
+                    index = index + 1,
+                    cells = directCells[address].orEmpty(),
+                    temperatures = realtime?.temperatures.orEmpty(),
+                    direct = realtime,
+                )
+            }
+        }
+        // Only a P6 and an X1 are asked for these reads by this engine, but an application is
+        // free to ask any model, and labelling whatever answers "P6" would put the wrong wheel
+        // in the title.
+        val isP6 = modelId == MODEL_P6
         return batteries.takeIf { it.isNotEmpty() }?.let {
             InmotionBmsSnapshot(
-                profileId = "inmotion_p6",
-                modelName = "Inmotion P6",
+                profileId = if (isP6) "inmotion_p6" else "inmotion_bms",
+                modelName = if (isP6) "Inmotion P6" else modelName() ?: "Inmotion",
                 batteries = it,
             )
         }
@@ -629,6 +1006,9 @@ class InmotionProtocolEngine {
             modelId == MODEL_P6 && size >= 54 -> toV14FamilyTelemetry("inmotion_p6", hasTirePressure = true)
             modelId in V14_MODELS && size >= 55 -> toV14FamilyTelemetry("inmotion_v14")
             modelId in V13_MODELS && size >= 55 -> toV14FamilyTelemetry("inmotion_v13")
+            // The P6 layout without tire pressure, which an X1 leaves at zero in every frame.
+            modelId == MODEL_X1 && size >= 55 -> toV14FamilyTelemetry("inmotion_v14")
+            modelId == MODEL_X1 -> null
             // Same fields as a V14, so the same dashboard profile: every metric the V14 layout
             // offers is present on these wheels too, and none that it lacks.
             modelId in V14_LAYOUT_MODELS && size >= 55 -> toV14FamilyTelemetry("inmotion_v14")
@@ -636,8 +1016,7 @@ class InmotionProtocolEngine {
             // different model's offsets - that is exactly how V12S used to read V12 bytes.
             modelId in V14_LAYOUT_MODELS -> null
             modelId in V12_MODELS && size >= 47 -> toV12Telemetry()
-            modelId == MODEL_V11 && size < 51 -> toV11LegacyTelemetry()
-            modelId == MODEL_V11 && size >= 58 -> toV11NewTelemetry()
+            modelId == MODEL_V11 -> toV11Telemetry()
             modelId == null && size < 51 -> toV11LegacyTelemetry()
             size >= 65 -> toV14FamilyTelemetry("inmotion_v14")
             size >= 47 -> toV12Telemetry()
@@ -692,7 +1071,7 @@ class InmotionProtocolEngine {
             busCurrentWarningAmps = uint16Le(thresholdOffset + 10) / 100.0,
             phaseCurrentLimitAmps = uint16Le(thresholdOffset + 12) / 100.0,
             mosTemperature = presentTemperature(temperatureOffset),
-            motorTemperature = presentTemperature(temperatureOffset + 1),
+            motorTemperature = presentTemperature(temperatureOffset + 1, zeroIsPresent = true),
             boardTemperature = presentTemperature(temperatureOffset + 3),
             cpuTemperature = presentTemperature(temperatureOffset + 4),
             imuTemperature = presentTemperature(temperatureOffset + 5),
@@ -729,6 +1108,17 @@ class InmotionProtocolEngine {
         )
     }
 
+    /**
+     * A V11 frame in the layout its length says. WheelLog forks on the main-board version instead
+     * (`major < 2 && minor < 4` is the old parser); both V11 captures here (main board 1.4, 68-byte
+     * frames) agree with either rule, and the length is known from the first frame, before the
+     * version block has answered. The 1.4+ frame is at least 56 bytes (`V11RealTimeInfo.fromBytes`
+     * rejects anything shorter), the old one well under that. A frame between 51 and 57 bytes used
+     * to fall through to the V12 decoder and be read with another model's offsets.
+     */
+    private fun ByteArray.toV11Telemetry(): InmotionTelemetry =
+        if (size < V11_NEW_LAYOUT_MIN_SIZE) toV11LegacyTelemetry() else toV11NewTelemetry()
+
     private fun ByteArray.toV11LegacyTelemetry(): InmotionTelemetry {
         val voltage = uint16Le(0) / 100.0
         val current = int16Le(2) / 100.0
@@ -763,7 +1153,7 @@ class InmotionProtocolEngine {
      * bytes and reads `bus_voltage`, `bus_current`, `speed`, `torque`, `output_rate`,
      * `battery_output_power` and `motor_output_power` as seven signed 16-bit values from
      * offset 0, then the seven temperature bytes from 42 - `mos`, `motor`, `battery`,
-     * `board`, `cpu`, `imu`, `lamp` in that order, each `+ 80 - 256`.
+     * `board`, `cpu`, `imu`, `lamp` in that order, each a signed byte `+ 80`.
      *
      * Torque, motor power and the temperatures are what this adds over the fields LoEUC
      * already read. The block between the angles and the temperatures holds three more
@@ -783,7 +1173,12 @@ class InmotionProtocolEngine {
             motorPower = int16Le(12).toDouble(),
             batteryPercent = uint16Le(28) / 100.0,
             rideBatteryPercent = Double.NaN,
-            tripDistanceMeters = uint16Le(26) * 10.0,
+            // `@24`, tens of meters - not `@26`, where WheelLog reads it. On a real ride
+            // (`loeuc_C6286FC174E2_unknown_20260918_203339.jsonl`, 52 s, 157 m by integrated speed)
+            // `@24` stepped 6 -> 22 at 9.9 m a step while `@26` stayed at zero throughout. The
+            // spin-up capture's 4 steps over "77 m" were a wheel spinning in the air, where the
+            // speed reading and the distance counter part ways.
+            tripDistanceMeters = uint16Le(24) * 10.0,
             // Torque in N*m, confirmed against hardware: over the 53 loaded frames of the
             // spin-up capture (loeuc_dump_1786714254.jsonl) this tracks motorPower/speed at
             // r=1.000, and the fitted slope is 0.249 m - the rolling radius of the V11's 18"
@@ -826,13 +1221,19 @@ class InmotionProtocolEngine {
 
 private const val FLAG_INITIAL = 0x11
 private const val FLAG_DEFAULT = 0x14
-private const val FLAG_MANY_TO_MANY = 0x16
 private const val COMMAND_MAIN_INFO = 0x02
 private const val COMMAND_REALTIME_ERROR = 0x03
 private const val COMMAND_REALTIME = 0x04
 private const val COMMAND_BATTERY_REALTIME = 0x05
 private const val COMMAND_SETTINGS = 0x08
 private const val COMMAND_SETTINGS_ALL = 0x20
+private const val COMMAND_TOTAL_STATS = 0x11
+private const val COMMAND_INTEGRATED_REALTIME = 0x07
+
+/** The official app rejects a shorter `0x87` answer; a P6 sends 98 bytes. */
+private const val P6_INTEGRATED_REALTIME_MIN_SIZE = 92
+private const val V11_NEW_LAYOUT_MIN_SIZE = 56
+
 private const val COMMAND_CONTROL = 0x60
 internal const val KEY_AUTO_LIGHT_STATE = "inmotion_auto_light_state"
 internal const val KEY_AUTO_LIGHT_LOW_THR = "inmotion_auto_light_low_thr"
@@ -919,8 +1320,8 @@ private const val SUB_WARNING_SPEED = 0x3E
  * `LorinPrivateRequestBody` setter table - which matters, because that table is shared
  * with scooters and several ids are reused there (`setSpeedLimit` and `setScreenBrightness`
  * both read `0x21`, `setMainSoundSwitch` and `setMaxChargeCurrent` both `0x39`). Anything
- * ambiguous is left read-only rather than guessed; that is why the charge limit, the
- * charge currents and the standby timer are still display-only.
+ * ambiguous is left read-only rather than guessed. P6 charging writes were resolved
+ * separately by three-agent review of Pro 1.8.00; see [InmotionP6ChargingCommands].
  *
  * Payload shapes come from the same disassembly: `setVoiceSwitch`,
  * `setDisplayAutoOffSwitch`, `setLowBatteryRideSwitch`, `setLogoLightSwitch`,
@@ -1000,6 +1401,21 @@ private const val MODEL_V11Y = 62
 private const val MODEL_V12S = 111
 private const val MODEL_V9 = 121
 private const val MODEL_P6 = 131
+
+/**
+ * The X1's main-info model block reads `01 02 11 01`, the code `021101010100` InMotion's own
+ * product API returns for it. Its `0x04` answer is the 86 bytes of a P6 one, read with the
+ * same offsets: in two rides recorded by another app, power is voltage times current in every
+ * frame, the pack voltage is the sum of the 56 cell voltages its BMS reports, and the speed
+ * follows the phone's GPS on steady stretches.
+ */
+private const val MODEL_X1 = 171
+
+/**
+ * Models asked the P6's extra reads: the integrated realtime `0x07`, the `0x05` battery frame
+ * and the direct BMS reads. The X1 answered `0x07` and both BMS selectors in that recording.
+ */
+private val P6_READ_MODELS = setOf(MODEL_P6, MODEL_X1)
 private val V14_MODELS = setOf(91, 92)
 private val V13_MODELS = setOf(81, 82)
 
@@ -1021,8 +1437,6 @@ private val V12_MODELS = setOf(71, 72, 73)
  * and its captured frames for all three decode to plausible values through them.
  */
 private val V14_LAYOUT_MODELS = setOf(MODEL_V11Y, MODEL_V12S, MODEL_V9)
-private val DIRECT_BMS_ADDRESSES = listOf(0x24, 0x25, 0x26, 0x27, 0x32, 0x34)
-private val DIRECT_BMS_SELECTORS = listOf(0x01, 0x02, 0x04)
 
 // Command 0x05 battery pack layout, see toBmsBatteries.
 private const val BmsPackSize = 8
@@ -1076,7 +1490,7 @@ private fun encodeLorinCommand(command: Int): ByteArray =
         byteArrayOf((0x20 or ((command shr 8) and 0x1F)).toByte(), (command and 0xFF).toByte())
     }
 
-private fun buildMessage(flag: Int, command: Int, data: ByteArray): ByteArray =
+internal fun buildInmotionV2Message(flag: Int, command: Int, data: ByteArray): ByteArray =
     buildFramedMessage(flag, encodeLorinCommand(command), data)
 
 private fun buildFramedMessage(flag: Int, commandBytes: ByteArray, data: ByteArray): ByteArray {
@@ -1154,15 +1568,15 @@ private fun ByteArray.toV11SettingCapabilities(): List<InmotionSettingCapability
     return listOf(
         setting(KEY_SPEED_LIMIT, "Speed limit, km/h", "Ограничение скорости, км/ч", uint16Le(0) / SPEED_SCALE, 0, SUB_SPEED_LIMIT, 0, SPEED_MAX_KMH, "slider"),
         setting(KEY_PITCH_ZERO, "Pedal angle trim, 0.1°", "Угол педалей, 0.1°", int16Le(2) / PITCH_SCALE, 2, SUB_BALANCE_ANGLE, -80, 80, "slider"),
-        setting("inmotion_driver_mode", "Controller mode", "Режим контроллера", u8(4) and 0xF, 4),
+        setting("inmotion_driver_mode", "driver_mode (purpose unknown)", "driver_mode (назначение неизвестно)", u8(4) and 0xF, 4),
         setting(KEY_RIDE_MODE, "Pedal mode", "Режим педалей", (u8(4) shr 4) and 0xF, 4),
-        setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity (Comfort)", "Чувствительность педалей (Комфорт)", u8(5), 5, SUB_PEDAL_SENSITIVITY, 0, 100, "slider"),
-        setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity (Classic)", "Чувствительность педалей (Классика)", u8(6), 6),
+        setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity (Comfort)", "Жёсткость педалей (Комфорт)", u8(5), 5, SUB_PEDAL_SENSITIVITY, 0, 100, "slider"),
+        setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity (Classic)", "Жёсткость педалей (Классика)", u8(6), 6),
         setting(KEY_VOICE_VOLUME, "Voice volume", "Громкость озвучки", u8(7), 7, SUB_VOLUME, 0, 100, "slider"),
         setting(
             KEY_STANDBY_TIME,
             "Standby timeout, min",
-            "Режим ожидания, мин",
+            "Автовыключение, мин",
             uint16Le(12) / STANDBY_SCALE,
             12,
             SUB_STANDBY_TIME,
@@ -1170,22 +1584,22 @@ private fun ByteArray.toV11SettingCapabilities(): List<InmotionSettingCapability
             STANDBY_MAX_MINUTES,
             "slider",
         ),
-        setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Режим светодиодных эффектов", u8(14), 14),
-        setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Порог датчика автосвета (низкий)", u8(15), 15),
-        setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Порог датчика автосвета (высокий)", u8(16), 16),
+        setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Эффект подсветки", u8(14), 14),
+        setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Автосвет: нижний порог", u8(15), 15),
+        setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Автосвет: верхний порог", u8(16), 16),
         setting(KEY_LIGHT_BRIGHTNESS, "Headlight brightness", "Яркость света", u8(17), 17, 0x2B, 0, LIGHT_BRIGHTNESS_MAX, "slider"),
-        setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Ассист разгона, %", u8(18), 18, SUB_ACCEL_BRAKE_ASSIST, 0, 100, "slider"),
-        setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Ассист торможения, %", u8(19), 19, SUB_ACCEL_BRAKE_ASSIST, 0, 100, "slider"),
+        setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Помощь при разгоне, %", u8(18), 18, SUB_ACCEL_BRAKE_ASSIST, 0, 100, "slider"),
+        setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Помощь при торможении, %", u8(19), 19, SUB_ACCEL_BRAKE_ASSIST, 0, 100, "slider"),
         setting(KEY_AUDIO_SWITCH, "Sound", "Звук", packed(20, 0), 20, SUB_VOICE_SWITCH, 0, 1, "toggle"),
         setting(KEY_DRL_STATE, "Daytime running lights", "Дневные ходовые огни", packed(20, 2), 20, SUB_DRL_V11, 0, 1, "toggle"),
-        setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Датчик поднятия", packed(20, 4), 20, SUB_LIFT_UP_DETECTION, 0, 1, "toggle"),
+        setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Остановка мотора при подъёме за ручку", packed(20, 4), 20, SUB_LIFT_UP_DETECTION, 0, 1, "toggle"),
         setting(KEY_AUTO_LIGHT_STATE, "Auto headlight", "Автосвет", packed(20, 6), 20, 0x2F, 0, 1, "toggle"),
         setting("inmotion_auto_brightness", "Auto brightness", "Автояркость", packed(21, 0), 21),
         setting(KEY_LOCK_MODE, "Wheel lock", "Замок колеса", packed(21, 2), 21, SUB_LOCK_MODE, 0, 1, "toggle"),
-        setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортировочный режим", packed(21, 4), 21, SUB_TRANSPORT_MODE, 0, 1, "toggle"),
+        setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортный режим", packed(21, 4), 21, SUB_TRANSPORT_MODE, 0, 1, "toggle"),
         setting("inmotion_load_detect", "Rider detection", "Датчик присутствия райдера", packed(21, 6), 21),
-        setting(KEY_NO_LOAD_DETECT, "No-load detection", "Датчик отсутствия нагрузки", packed(22, 0), 22, SUB_NO_LOAD_DETECT, 0, 1, "toggle"),
-        setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Режим езды при низком заряде", packed(22, 2), 22, SUB_LOW_BATTERY_RIDE, 0, 1, "toggle"),
+        setting(KEY_NO_LOAD_DETECT, "No-load detection", "Защита при вращении без нагрузки", packed(22, 0), 22, SUB_NO_LOAD_DETECT, 0, 1, "toggle"),
+        setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Езда при низком заряде", packed(22, 2), 22, SUB_LOW_BATTERY_RIDE, 0, 1, "toggle"),
         // Both fan rows are display-only, and not by policy: `fan_status` is a *status* (the same
         // status/mode split `drl_light_status` has - the official `toMap` exposes only
         // `fan_mute_mode` as a fan setting), and neither has a usable write id. `0x43` is
@@ -1232,44 +1646,44 @@ private fun ByteArray.toV13FamilySettingCapabilities(isV11y: Boolean): List<Inmo
     fun packed(offset: Int, position: Int, mask: Int = 0x3) = (u8(offset) shr position) and mask
     return buildList {
         add(setting(KEY_SPEED_LIMIT, "Speed limit, km/h", "Ограничение скорости, км/ч", uint16Le(0) / SPEED_SCALE, 0))
-        add(setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Порог предупреждения 1, км/ч", uint16Le(2) / SPEED_SCALE, 2))
+        add(setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Скоростной аларм 1, км/ч", uint16Le(2) / SPEED_SCALE, 2))
         add(setting(KEY_PITCH_ZERO, "Pedal angle trim, 0.1°", "Угол педалей, 0.1°", int16Le(8) / PITCH_SCALE, 8))
-        add(setting("inmotion_driver_mode", "Controller mode", "Режим контроллера", u8(10) and 0xF, 10))
+        add(setting("inmotion_driver_mode", "driver_mode (purpose unknown)", "driver_mode (назначение неизвестно)", u8(10) and 0xF, 10))
         add(setting(KEY_RIDE_MODE, "Pedal mode", "Режим педалей", (u8(10) shr 4) and 0xF, 10))
-        add(setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Чувствительность педалей 1", u8(11), 11))
-        add(setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Чувствительность педалей 2", u8(12), 12))
-        add(setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Ассист разгона, %", int8(13), 13))
-        add(setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Ассист торможения, %", int8(14), 14))
+        add(setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Жёсткость педалей 1", u8(11), 11))
+        add(setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Жёсткость педалей 2", u8(12), 12))
+        add(setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Помощь при разгоне, %", int8(13), 13))
+        add(setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Помощь при торможении, %", int8(14), 14))
         add(setting(KEY_VOICE_VOLUME, "Voice volume", "Громкость озвучки", u8(15), 15, SUB_VOLUME, 0, 100, "slider"))
-        add(setting(KEY_STANDBY_TIME, "Standby timeout, min", "Режим ожидания, мин", uint16Le(20) / STANDBY_SCALE, 20))
-        add(setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Режим светодиодных эффектов", u8(22), 22))
-        add(setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Порог датчика автосвета (низкий)", u8(23), 23))
-        add(setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Порог датчика автосвета (высокий)", u8(24), 24))
+        add(setting(KEY_STANDBY_TIME, "Standby timeout, min", "Автовыключение, мин", uint16Le(20) / STANDBY_SCALE, 20))
+        add(setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Эффект подсветки", u8(22), 22))
+        add(setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Автосвет: нижний порог", u8(23), 23))
+        add(setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Автосвет: верхний порог", u8(24), 24))
         if (isV11y) {
             add(setting(KEY_LOW_BEAM_BRIGHTNESS, "Low beam brightness", "Яркость ближнего света", u8(25), 25))
-            add(setting("inmotion_charge_cut_off_percent", "Charge cut-off, %", "Ограничение заряда, %", u8(26), 26))
+            add(setting("inmotion_charge_cut_off_percent", "Charge cut-off, %", "Предел зарядки, %", u8(26), 26))
         } else {
             add(setting(KEY_LIGHT_BRIGHTNESS, "Headlight brightness", "Яркость света", u8(25), 25))
         }
         add(setting(KEY_AUDIO_SWITCH, "Sound", "Звук", packed(30, 0), 30, SUB_VOICE_SWITCH, 0, 1, "toggle"))
         add(setting(KEY_DRL_STATE, "Daytime running lights", "Дневные ходовые огни", packed(30, 2), 30))
-        add(setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Датчик поднятия", packed(30, 4), 30))
+        add(setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Остановка мотора при подъёме за ручку", packed(30, 4), 30))
         add(setting(KEY_AUTO_LIGHT_STATE, "Auto headlight", "Автосвет", packed(30, 6), 30, SUB_AUTO_HEADLIGHT, 0, 1, "toggle"))
         add(setting("inmotion_auto_brightness", "Auto brightness", "Автояркость", packed(31, 0), 31))
         add(setting(KEY_LOCK_MODE, "Wheel lock", "Замок колеса", packed(31, 2), 31))
-        add(setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортировочный режим", packed(31, 4), 31))
+        add(setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортный режим", packed(31, 4), 31))
         add(setting("inmotion_load_detect", "Rider detection", "Датчик присутствия райдера", packed(31, 6), 31))
-        add(setting(KEY_NO_LOAD_DETECT, "No-load detection", "Датчик отсутствия нагрузки", packed(32, 0), 32))
-        add(setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Режим езды при низком заряде", packed(32, 2), 32))
+        add(setting(KEY_NO_LOAD_DETECT, "No-load detection", "Защита при вращении без нагрузки", packed(32, 0), 32))
+        add(setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Езда при низком заряде", packed(32, 2), 32))
         add(setting(KEY_QUIET_FAN, "Quiet fan mode", "Тихий режим вентилятора", packed(32, 4), 32))
         add(setting("inmotion_active_sound", "Active sound", "Активный звук", packed(32, 6), 32))
         add(setting("inmotion_touch_key", "Touch key", "Сенсорная кнопка", packed(33, 0), 33))
         add(setting("inmotion_usb_power_switch", "USB power", "Питание USB", packed(33, 2, mask = 0xF), 33))
         add(setting("inmotion_range_estimate", "Range estimate", "Расчёт запаса хода", packed(33, 6), 33))
-        add(setting("inmotion_assist_balance", "Assist balance", "Балансировка ассистента", packed(34, 0), 34))
-        add(setting("inmotion_acce_feedback", "Acceleration feedback switch", "Переключатель отклика разгона", packed(34, 2), 34))
+        add(setting("inmotion_assist_balance", "assist_balance (purpose unknown)", "assist_balance (назначение неизвестно)", packed(34, 0), 34))
+        add(setting("inmotion_acce_feedback", "acce_feedback (purpose unknown)", "acce_feedback (назначение неизвестно)", packed(34, 2), 34))
         add(setting(KEY_SPEED_LIMIT_UNLOCK, "Speed limit unlocked", "Ограничение скорости снято", packed(34, 4, mask = 0x1), 34))
-        add(setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Компенсация уклона в вираже", packed(34, 5, mask = 0x1), 34))
+        add(setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Режим бермы", packed(34, 5, mask = 0x1), 34))
     }
 }
 
@@ -1299,50 +1713,50 @@ private fun ByteArray.toV12sFamilySettingCapabilities(isV9: Boolean): List<Inmot
     fun flag(bit: Int) = if (flags.bit(bit)) 1 else 0
     return buildList {
         add(setting(KEY_SPEED_LIMIT, "Speed limit, km/h", "Ограничение скорости, км/ч", uint16Le(8) / SPEED_SCALE, 8))
-        add(setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Порог предупреждения 1, км/ч", uint16Le(10) / SPEED_SCALE, 10))
-        add(setting(KEY_SPEED_WARNING_2, "Speed warning 2, km/h", "Порог предупреждения 2, км/ч", uint16Le(12) / SPEED_SCALE, 12))
+        add(setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Скоростной аларм 1, км/ч", uint16Le(10) / SPEED_SCALE, 10))
+        add(setting(KEY_SPEED_WARNING_2, "Speed warning 2, km/h", "Скоростной аларм 2, км/ч", uint16Le(12) / SPEED_SCALE, 12))
         add(setting(KEY_PITCH_ZERO, "Pedal angle trim, 0.1°", "Угол педалей, 0.1°", int16Le(14) / PITCH_SCALE, 14))
-        add(setting(KEY_STANDBY_TIME, "Standby timeout, min", "Режим ожидания, мин", uint16Le(16) / STANDBY_SCALE, 16))
-        add(setting("inmotion_driver_mode", "Controller mode", "Режим контроллера", u8(18) and 0xF, 18))
+        add(setting(KEY_STANDBY_TIME, "Standby timeout, min", "Автовыключение, мин", uint16Le(16) / STANDBY_SCALE, 16))
+        add(setting("inmotion_driver_mode", "driver_mode (purpose unknown)", "driver_mode (назначение неизвестно)", u8(18) and 0xF, 18))
         add(setting(KEY_RIDE_MODE, "Pedal mode", "Режим педалей", (u8(18) shr 4) and 0xF, 18))
-        add(setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Чувствительность педалей 1", u8(19), 19))
-        add(setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Чувствительность педалей 2", u8(20), 20))
+        add(setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Жёсткость педалей 1", u8(19), 19))
+        add(setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Жёсткость педалей 2", u8(20), 20))
         add(setting(KEY_VOICE_VOLUME, "Voice volume", "Громкость озвучки", u8(21), 21, SUB_VOLUME, 0, 100, "slider"))
-        add(setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Режим светодиодных эффектов", u8(22), 22))
-        add(setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Порог датчика автосвета (низкий)", u8(23), 23))
-        add(setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Порог датчика автосвета (высокий)", u8(24), 24))
+        add(setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Эффект подсветки", u8(22), 22))
+        add(setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Автосвет: нижний порог", u8(23), 23))
+        add(setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Автосвет: верхний порог", u8(24), 24))
         add(setting(KEY_LOW_BEAM_BRIGHTNESS, "Low beam brightness", "Яркость ближнего света", u8(25), 25))
         add(setting(KEY_HIGH_BEAM_BRIGHTNESS, "High beam brightness", "Яркость дальнего света", u8(26), 26))
         add(setting("inmotion_active_sound_sensitivity", "Active sound sensitivity", "Чувствительность активного звука", u8(27), 27))
-        add(setting("inmotion_high_beam_auto_switch_speed", "High beam auto switch speed, km/h", "Скорость автопереключения дальнего, км/ч", uint16Le(28) / SPEED_SCALE, 28))
-        add(setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Ассист разгона, %", int8(30), 30))
-        add(setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Ассист торможения, %", int8(31), 31))
+        add(setting("inmotion_high_beam_auto_switch_speed", "High beam auto switch speed, km/h", "Скорость переключения ближний/дальний свет, км/ч", uint16Le(28) / SPEED_SCALE, 28))
+        add(setting(KEY_ACCEL_ASSIST, "Acceleration assist, %", "Помощь при разгоне, %", int8(30), 30))
+        add(setting(KEY_BRAKE_ASSIST, "Brake assist, %", "Помощь при торможении, %", int8(31), 31))
         add(setting(KEY_AUDIO_SWITCH, "Sound", "Звук", flag(0), 38, SUB_VOICE_SWITCH, 0, 1, "toggle"))
-        add(setting("inmotion_turn_signal_light", "Turn signal active", "Активен поворотник", flag(1), 38))
-        add(setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Датчик поднятия", flag(2), 38))
+        add(setting("inmotion_turn_signal_light", "Turn signal active", "Поворотник сейчас включён", flag(1), 38))
+        add(setting(KEY_LIFT_UP_DETECTION, "Lift-up detection", "Остановка мотора при подъёме за ручку", flag(2), 38))
         add(setting(KEY_AUTO_LIGHT_STATE, "Auto headlight", "Автосвет", flag(3), 38, SUB_AUTO_HEADLIGHT, 0, 1, "toggle"))
         add(setting("inmotion_auto_brightness", "Auto brightness", "Автояркость", flag(4), 38))
         add(setting(KEY_LOCK_MODE, "Wheel lock", "Замок колеса", flag(5), 38))
-        add(setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортировочный режим", flag(6), 38))
+        add(setting(KEY_TRANSPORT_MODE, "Transport mode", "Транспортный режим", flag(6), 38))
         add(setting("inmotion_load_detect", "Rider detection", "Датчик присутствия райдера", flag(7), 38))
-        add(setting(KEY_NO_LOAD_DETECT, "No-load detection", "Датчик отсутствия нагрузки", flag(8), 38))
-        add(setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Режим езды при низком заряде", flag(9), 38))
+        add(setting(KEY_NO_LOAD_DETECT, "No-load detection", "Защита при вращении без нагрузки", flag(8), 38))
+        add(setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Езда при низком заряде", flag(9), 38))
         add(setting("inmotion_active_sound", "Active sound", "Активный звук", flag(10), 38))
         add(setting("inmotion_touch_key", "Touch key", "Сенсорная кнопка", flag(11), 38))
         add(setting("inmotion_usb_power_switch", "USB power", "Питание USB", flag(12), 38))
         add(setting(KEY_AUTO_CLOSE_SCREEN, "Auto screen off", "Автовыключение экрана", flag(13), 38))
         add(setting("inmotion_range_estimate", "Range estimate", "Расчёт запаса хода", flag(14), 38))
-        add(setting("inmotion_assist_balance", "Assist balance", "Балансировка ассистента", flag(15), 38))
-        add(setting("inmotion_acce_feedback", "Acceleration feedback switch", "Переключатель отклика разгона", flag(16), 38))
+        add(setting("inmotion_assist_balance", "assist_balance (purpose unknown)", "assist_balance (назначение неизвестно)", flag(15), 38))
+        add(setting("inmotion_acce_feedback", "acce_feedback (purpose unknown)", "acce_feedback (назначение неизвестно)", flag(16), 38))
         if (isV9) {
             add(setting(KEY_METRIC_UNIT, "Metric units", "Метрические единицы", flag(17), 38))
             add(setting(KEY_DRL_STATE, "Daytime running lights", "Дневные ходовые огни", flag(18), 38))
         } else {
-            add(setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Компенсация уклона в вираже", flag(17), 38))
+            add(setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Режим бермы", flag(17), 38))
             add(setting("inmotion_logo_light_status", "Logo light", "Подсветка логотипа", flag(18), 38))
         }
-        add(setting("inmotion_tbox_low_battery_wakeup", "T-Box low battery wake-up", "Пробуждение T-Box при низком заряде", flag(19), 38))
-        add(setting("inmotion_show_tbox_info", "Show T-Box info", "Показывать данные T-Box", flag(20), 38))
+        add(setting("inmotion_tbox_low_battery_wakeup", "T-Box low battery wake-up", "Ride Connect (T-Box): будить при низком заряде", flag(19), 38))
+        add(setting("inmotion_show_tbox_info", "Show T-Box info", "Показывать данные Ride Connect (T-Box)", flag(20), 38))
     }
 }
 
@@ -1366,7 +1780,7 @@ private fun ByteArray.toV12SettingCapabilities(): List<InmotionSettingCapability
         InmotionSettingCapability(
             key = KEY_AUTO_LIGHT_LOW_THR,
             titleEn = "Auto headlight sensor threshold (low)",
-            titleRu = "Порог датчика автосвета (низкий)",
+            titleRu = "Автосвет: нижний порог",
             rawValue = u8(23),
             sourceOffset = 23,
             commandId = 0x2A,
@@ -1377,7 +1791,7 @@ private fun ByteArray.toV12SettingCapabilities(): List<InmotionSettingCapability
         InmotionSettingCapability(
             key = KEY_AUTO_LIGHT_HIGH_THR,
             titleEn = "Auto headlight sensor threshold (high)",
-            titleRu = "Порог датчика автосвета (высокий)",
+            titleRu = "Автосвет: верхний порог",
             rawValue = u8(24),
             sourceOffset = 24,
             commandId = 0x2A,
@@ -1447,7 +1861,7 @@ private fun ByteArray.toV14SettingCapabilities(): List<InmotionSettingCapability
         InmotionSettingCapability(
             key = KEY_AUTO_LIGHT_LOW_THR,
             titleEn = "Auto headlight sensor threshold (low)",
-            titleRu = "Порог датчика автосвета (низкий)",
+            titleRu = "Автосвет: нижний порог",
             rawValue = u8(23),
             sourceOffset = 23,
             commandId = 0x2A,
@@ -1458,7 +1872,7 @@ private fun ByteArray.toV14SettingCapabilities(): List<InmotionSettingCapability
         InmotionSettingCapability(
             key = KEY_AUTO_LIGHT_HIGH_THR,
             titleEn = "Auto headlight sensor threshold (high)",
-            titleRu = "Порог датчика автосвета (высокий)",
+            titleRu = "Автосвет: верхний порог",
             rawValue = u8(24),
             sourceOffset = 24,
             commandId = 0x2A,
@@ -1504,21 +1918,21 @@ private fun ByteArray.toP6SettingCapabilities(): List<InmotionSettingCapability>
     fun flag(bit: Int) = if (flags.bit(bit)) 1 else 0
     return listOf(
         setting(KEY_RIDE_MODE, "Pedal mode", "Режим педалей", (u8(24) shr 4) and 0xF, 24, SUB_RIDE_MODE, 0, 2, "slider"),
-        setting("inmotion_driver_mode", "Controller mode", "Режим контроллера", u8(24) and 0xF, 24),
-        setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Чувствительность педалей 1", u8(25), 25, SUB_PEDAL_SENSITIVITY, 0, 100, "slider"),
-        setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Чувствительность педалей 2", u8(26), 26, SUB_PEDAL_SENSITIVITY, 0, 100, "slider"),
+        setting("inmotion_driver_mode", "driver_mode (purpose unknown)", "driver_mode (назначение неизвестно)", u8(24) and 0xF, 24),
+        setting(KEY_PEDAL_SENSITIVITY_1, "Pedal sensitivity 1", "Жёсткость педалей 1", u8(25), 25, SUB_PEDAL_SENSITIVITY, 0, 100, "slider"),
+        setting(KEY_PEDAL_SENSITIVITY_2, "Pedal sensitivity 2", "Жёсткость педалей 2", u8(26), 26, SUB_PEDAL_SENSITIVITY, 0, 100, "slider"),
         setting(KEY_VOICE_VOLUME, "Voice volume", "Громкость озвучки", u8(27), 27, SUB_VOLUME, 0, 100, "slider"),
-        setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Режим светодиодных эффектов", u8(28), 28, SUB_LIGHT_EFFECT_MODE, 0, 255, "slider"),
-        setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Порог датчика автосвета (низкий)", u8(29), 29, 0x2A, 0, 255, "slider"),
-        setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Порог датчика автосвета (высокий)", u8(30), 30, 0x2A, 0, 255, "slider"),
+        setting(KEY_LIGHT_EFFECT_MODE, "LED effect mode", "Эффект подсветки", u8(28), 28, SUB_LIGHT_EFFECT_MODE, 0, 255, "slider"),
+        setting(KEY_AUTO_LIGHT_LOW_THR, "Auto headlight sensor threshold (low)", "Автосвет: нижний порог", u8(29), 29, 0x2A, 0, 255, "slider"),
+        setting(KEY_AUTO_LIGHT_HIGH_THR, "Auto headlight sensor threshold (high)", "Автосвет: верхний порог", u8(30), 30, 0x2A, 0, 255, "slider"),
         setting(KEY_LOW_BEAM_BRIGHTNESS, "Low beam brightness", "Яркость ближнего света", u8(31), 31, 0x2B, 0, 100, "slider"),
         setting(KEY_HIGH_BEAM_BRIGHTNESS, "High beam brightness", "Яркость дальнего света", u8(32), 32, 0x2B, 0, 100, "slider"),
         setting(KEY_AUTO_LIGHT_STATE, "Auto headlight", "Автосвет", flag(3), 45, 0x2F, 0, 1, "toggle"),
         setting(KEY_DRL_STATE, "Daytime running lights", "Дневные ходовые огни", flag(21), 45, SUB_DRL_P6, 0, 1, "toggle"),
-        setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Компенсация уклона в вираже", flag(17), 45, SUB_BERM_ANGLE_MODE_P6, 0, 1, "toggle"),
+        setting(KEY_BERM_ANGLE_MODE, "Berm angle mode", "Режим бермы", flag(17), 45, SUB_BERM_ANGLE_MODE_P6, 0, 1, "toggle"),
         setting(KEY_SPEED_LIMIT, "Speed limit, km/h", "Ограничение скорости, км/ч", uint16Le(8) / SPEED_SCALE, 8, SUB_SPEED_LIMIT, 0, SPEED_MAX_KMH, "slider"),
-        setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Порог предупреждения 1, км/ч", uint16Le(10) / SPEED_SCALE, 10, SUB_WARNING_SPEED, 0, SPEED_MAX_KMH, "slider"),
-        setting(KEY_SPEED_WARNING_2, "Speed warning 2, km/h", "Порог предупреждения 2, км/ч", uint16Le(12) / SPEED_SCALE, 12, SUB_WARNING_SPEED, 0, SPEED_MAX_KMH, "slider"),
+        setting(KEY_SPEED_WARNING_1, "Speed warning 1, km/h", "Скоростной аларм 1, км/ч", uint16Le(10) / SPEED_SCALE, 10, SUB_WARNING_SPEED, 0, SPEED_MAX_KMH, "slider"),
+        setting(KEY_SPEED_WARNING_2, "Speed warning 2, km/h", "Скоростной аларм 2, км/ч", uint16Le(12) / SPEED_SCALE, 12, SUB_WARNING_SPEED, 0, SPEED_MAX_KMH, "slider"),
         setting(KEY_PITCH_ZERO, "Pedal angle trim, 0.1°", "Угол педалей, 0.1°", int16Le(20) / PITCH_SCALE, 20, SUB_BALANCE_ANGLE, -80, 80, "slider"),
         // Decoded but never written: no resolved command id, or writing it can cut motor
         // power under the rider. See KIND_READONLY.
@@ -1527,12 +1941,12 @@ private fun ByteArray.toP6SettingCapabilities(): List<InmotionSettingCapability>
         // standby in seconds (14400 = 240 min), tyre alarm in hundred-thousandths of a bar
         // (19000 = 1.90 bar, exposed as millibar so the integer stays exact), charge
         // currents in tenths of an amp (30 = 3.0 A). See docs/inmotion-protocol-notes.md.
-        setting("inmotion_output_tiltback_threshold", "Output tiltback threshold, %", "Порог откидывания по выходу, %", int16Le(14) / 100, 14),
-        setting("inmotion_output_warning_threshold_1", "Output warning 1, %", "Порог предупреждения по выходу 1, %", int16Le(16) / 100, 16),
-        setting("inmotion_output_warning_threshold_2", "Output warning 2, %", "Порог предупреждения по выходу 2, %", int16Le(18) / 100, 18),
-        setting("inmotion_standby_time", "Standby timeout, min", "Режим ожидания, мин", uint16Le(22) / 60, 22),
+        setting("inmotion_output_tiltback_threshold", "Output tiltback threshold, %", "Тилтбэк по ШИМ, %", int16Le(14) / 100, 14),
+        setting("inmotion_output_warning_threshold_1", "Output warning 1, %", "Предупреждение по ШИМ 1, %", int16Le(16) / 100, 16),
+        setting("inmotion_output_warning_threshold_2", "Output warning 2, %", "Предупреждение по ШИМ 2, %", int16Le(18) / 100, 18),
+        setting("inmotion_standby_time", "Standby timeout, min", "Автовыключение, мин", uint16Le(22) / 60, 22),
         setting("inmotion_active_sound_sensitivity", "Active sound sensitivity", "Чувствительность активного звука", u8(33), 33),
-        setting("inmotion_high_beam_auto_switch_speed", "High beam auto switch speed, km/h", "Скорость автопереключения дальнего, км/ч", uint16Le(34) / SPEED_SCALE, 34),
+        setting("inmotion_high_beam_auto_switch_speed", "High beam auto switch speed, km/h", "Скорость переключения ближний/дальний свет, км/ч", uint16Le(34) / SPEED_SCALE, 34),
         // The pair `setAccAndBrakeAssistPercentage` writes: the setter clamps both to
         // 0..100, and a real P6 reads 50/50 here. This is the whole of "pedal adjustment"
         // the protocol carries - the four angle/rate rows the official app shows on that
@@ -1540,37 +1954,37 @@ private fun ByteArray.toP6SettingCapabilities(): List<InmotionSettingCapability>
         // surface, so the app derives them. Read-only here: the write command id exists
         // only on V14 (`V14Cmd.accAndBrakeAssistPercentageCmd` = 0x3F) and P6 inherits no
         // equivalent.
-        setting("inmotion_speeding_feedback", "Acceleration assist, %", "Ассист разгона, %", int8(36), 36),
-        setting("inmotion_braking_feedback", "Brake assist, %", "Ассист торможения, %", int8(37), 37),
-        setting(KEY_TPMS_LOW_ALARM, "Tyre low pressure alarm, mbar", "Порог низкого давления шины, мбар", uint16Le(38) / TPMS_SCALE, 38, SUB_TPMS_LOW_ALARM, 0, TPMS_MAX_MBAR, "slider"),
+        setting("inmotion_speeding_feedback", "Acceleration assist, %", "Помощь при разгоне, %", int8(36), 36),
+        setting("inmotion_braking_feedback", "Brake assist, %", "Помощь при торможении, %", int8(37), 37),
+        setting(KEY_TPMS_LOW_ALARM, "Tyre low pressure alarm, mbar", "Сигнал о низком давлении в шине, мбар", uint16Le(38) / TPMS_SCALE, 38, SUB_TPMS_LOW_ALARM, 0, TPMS_MAX_MBAR, "slider"),
         setting(KEY_LOGO_LIGHT_BRIGHTNESS, "Logo light brightness, %", "Яркость подсветки логотипа, %", u8(40), 40, SUB_LOGO_LIGHT, 0, 100, "slider"),
         setting(KEY_BERM_ANGLE, "Berm angle, °", "Угол наклона бермы, °", u8(41), 41, SUB_BERM_ANGLE, 0, BERM_ANGLE_MAX_DEGREES, "slider"),
-        setting("inmotion_charge_cut_off_percent", "Charge cut-off, %", "Ограничение заряда, %", u8(42), 42),
-        setting("inmotion_max_charge_current_ac220", "Max charge current 220V, 0.1 A", "Макс. ток заряда 220 В, 0.1 А", u8(43), 43),
-        setting("inmotion_max_charge_current_ac110", "Max charge current 110V, 0.1 A", "Макс. ток заряда 110 В, 0.1 А", u8(44), 44),
+        setting(InmotionP6ChargingCommands.ChargeCutoffKey, "Charge cut-off, %", "Предел зарядки, %", u8(42), 42, 0x38, 60, 100, "slider", step = 5),
+        setting(InmotionP6ChargingCommands.Ac220Key, "Max charge current (220 V)", "Макс. ток зарядки от 220 В", u8(43), 43, 0x39, 10, 160, "slider", step = 10),
+        setting(InmotionP6ChargingCommands.Ac110Key, "Max charge current (110 V)", "Макс. ток зарядки от 110 В", u8(44), 44, 0x39, 10, 80, "slider", step = 10),
         setting(KEY_AUDIO_SWITCH, "Sound", "Звук", flag(0), 45, SUB_VOICE_SWITCH, 0, 1, "toggle"),
-        setting("inmotion_turn_signal_light", "Turn signal active", "Активен поворотник", flag(1), 45),
-        setting("inmotion_lift_up_detection", "Lift-up detection", "Датчик поднятия", flag(2), 45),
+        setting("inmotion_turn_signal_light", "Turn signal active", "Поворотник сейчас включён", flag(1), 45),
+        setting("inmotion_lift_up_detection", "Lift-up detection", "Остановка мотора при подъёме за ручку", flag(2), 45),
         setting("inmotion_auto_brightness", "Auto brightness", "Автояркость", flag(4), 45),
         setting("inmotion_lock_mode", "Wheel lock", "Замок колеса", flag(5), 45),
-        setting("inmotion_transport_mode", "Transport mode", "Транспортировочный режим", flag(6), 45),
+        setting("inmotion_transport_mode", "Transport mode", "Транспортный режим", flag(6), 45),
         setting("inmotion_load_detect", "Rider detection", "Датчик присутствия райдера", flag(7), 45),
-        setting("inmotion_no_load_detect", "No-load detection", "Датчик отсутствия нагрузки", flag(8), 45),
+        setting("inmotion_no_load_detect", "No-load detection", "Защита при вращении без нагрузки", flag(8), 45),
         // Read-only on purpose, though its id (0x37) is as solid as the others: switching
         // it off is what stops a wheel from riding on a low pack, and an alert rule could
         // do that under a rider at 10 %. Same reasoning as lock/transport/lift-up.
-        setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Режим езды при низком заряде", flag(9), 45),
+        setting(KEY_LOW_BATTERY_RIDE, "Low battery ride mode", "Езда при низком заряде", flag(9), 45),
         setting("inmotion_active_sound", "Active sound", "Активный звук", flag(10), 45),
         setting("inmotion_touch_key", "Touch key", "Сенсорная кнопка", flag(11), 45),
         setting("inmotion_usb_power_switch", "USB power", "Питание USB", flag(12), 45),
         setting(KEY_AUTO_CLOSE_SCREEN, "Auto screen off", "Автовыключение экрана", flag(13), 45, SUB_DISPLAY_AUTO_OFF, 0, 1, "toggle"),
         setting("inmotion_range_estimate", "Range estimate", "Расчёт запаса хода", flag(14), 45),
-        setting("inmotion_assist_balance", "Assist balance", "Балансировка ассистента", flag(15), 45),
-        setting("inmotion_acce_feedback", "Acceleration feedback switch", "Переключатель отклика разгона", flag(16), 45),
+        setting("inmotion_assist_balance", "assist_balance (purpose unknown)", "assist_balance (назначение неизвестно)", flag(15), 45),
+        setting("inmotion_acce_feedback", "acce_feedback (purpose unknown)", "acce_feedback (назначение неизвестно)", flag(16), 45),
         setting("inmotion_logo_light_status", "Logo light", "Подсветка логотипа", flag(18), 45),
-        setting("inmotion_tbox_low_battery_wakeup", "T-Box low battery wake-up", "Пробуждение T-Box при низком заряде", flag(19), 45),
-        setting("inmotion_show_tbox_info", "Show T-Box info", "Показывать данные T-Box", flag(20), 45),
-        setting("inmotion_shield_tps_error", "Mute TPMS fault", "Скрыть ошибку TPMS", flag(22), 45),
+        setting("inmotion_tbox_low_battery_wakeup", "T-Box low battery wake-up", "Ride Connect (T-Box): будить при низком заряде", flag(19), 45),
+        setting("inmotion_show_tbox_info", "Show T-Box info", "Показывать данные Ride Connect (T-Box)", flag(20), 45),
+        setting("inmotion_shield_tps_error", "Mute TPMS fault", "Игнорировать предупреждение о давлении в шине", flag(22), 45),
         setting(KEY_TURN_LIGHT_MODE, "Turn signal mode", "Режим поворотников", (flags shr 23) and 0x7, 45, SUB_TURN_LIGHT_MODE, 0, TURN_LIGHT_MODE_MAX, "slider"),
         setting(KEY_TAIL_LIGHT_MODE, "Tail light mode", "Режим заднего фонаря", flag(26), 45, SUB_TAIL_LIGHT_MODE, 0, 1, "toggle"),
         setting("inmotion_auto_lock", "Auto lock on shutdown", "Автозамок при выключении", flag(27), 45),
@@ -1587,6 +2001,7 @@ private fun setting(
     minValue: Int = 0,
     maxValue: Int = 0,
     kind: String = KIND_READONLY,
+    step: Int = 1,
 ) = InmotionSettingCapability(
     key = key,
     titleEn = titleEn,
@@ -1597,6 +2012,7 @@ private fun setting(
     minValue = minValue,
     maxValue = maxValue,
     kind = kind,
+    step = step,
 )
 
 private fun ByteArray.modelId(): Int? {
@@ -1670,31 +2086,87 @@ private fun ByteArray.isValidV2Frame(): Boolean {
         return false
     }
     val checksum = (2 until lastIndex).fold(0) { value, index -> value xor u8(index) }
-    return checksum == u8(lastIndex) && u8(2) in setOf(0x11, 0x14, 0x16)
+    return checksum == u8(lastIndex) && u8(2) in InmotionV2Frames.FLAGS
 }
+
+/**
+ * Where the command field starts: behind the address bytes of a main-board answer, and at
+ * byte 4 for everything else. A direct BMS answer keeps byte 4 - its source address - which
+ * is what this engine has always read there, so its bookkeeping does not change.
+ */
+private fun ByteArray.v2CommandIndex(): Int = InmotionV2Frames.mainBoardCommandIndex(this) ?: 4
 
 /**
  * How many bytes the frame's command field takes, so the payload behind it can be found.
  * See [encodeLorinCommand]: bit `0x20` on the first byte means a second one follows.
  *
- * Many-to-many frames are excluded - their body is a source/target/command triple rather
- * than an encoded command field, and their source address (`0x24`, `0x25`, `0x32`, …)
- * would trip the same bit.
+ * Many-to-many frames from anything but the main board are excluded - their body is a
+ * source/target/command triple read by [InmotionDirectBms], and their source address
+ * (`0x24`, `0x25`, `0x32`, …) would trip the same bit.
  */
 private fun ByteArray.v2CommandSize(): Int {
-    if (u8(2) == FLAG_MANY_TO_MANY) {
-        return 1
-    }
-    return if (u8(4) and 0x20 != 0) 2 else 1
+    val index = InmotionV2Frames.mainBoardCommandIndex(this) ?: return 1
+    return if (u8(index) and 0x20 != 0) 2 else 1
 }
 
 private fun ByteArray.v2Data(): ByteArray {
     if (size < 6) {
         return byteArrayOf()
     }
-    val commandSize = v2CommandSize()
-    val dataSize = minOf(u8(3) - commandSize, size - 1 - (4 + commandSize))
-    return if (dataSize <= 0) byteArrayOf() else copyOfRange(4 + commandSize, 4 + commandSize + dataSize)
+    val start = v2CommandIndex() + v2CommandSize()
+    val dataSize = minOf(u8(3) - (start - 4), size - 1 - start)
+    return if (dataSize <= 0) byteArrayOf() else copyOfRange(start, start + dataSize)
+}
+
+/**
+ * Where an InMotion V2 frame keeps its command field.
+ *
+ * The flag's low three bits are the official app's `LorinDataFormatType`, and the format
+ * decides how many address bytes stand between the length and the command: none for
+ * formats 1 and 4, the target for format 2, source then target for formats 3 and 6 (see
+ * "The flag byte is computed" in `docs/inmotion-protocol-notes.md`).
+ *
+ * Most wheels answer the format they were asked in, so LoEUC's `0x11`/`0x14` requests come
+ * back unaddressed. An X1 recorded by another app answered every main-board read addressed:
+ * main info in formats 2 and 3 (`AA AA 12 09 02 82 …`, `AA AA 13 10 21 02 82 …`) and
+ * realtime, statistics, errors and settings in format 6 (`AA AA 16 59 21 02 84 …`). The
+ * payload behind the command field is the same in both shapes.
+ */
+object InmotionV2Frames {
+    /** The address the app uses for itself, as source of a request and target of an answer. */
+    const val HOST_ADDRESS: Int = 0x02
+
+    /** The wheel's main board, as an X1 names itself in the source byte of its answers. */
+    const val MAIN_BOARD_ADDRESS: Int = 0x21
+
+    /** Flags with the XOR check and no encryption, in every format seen on the wire. */
+    val FLAGS: Set<Int> = setOf(0x11, 0x12, 0x13, 0x14, 0x16)
+
+    /**
+     * Index of the command byte when [frame] is the main board talking to the app - or an
+     * unaddressed frame, which can only be that - and null otherwise: a BMS, the TBox or any
+     * other address, whose frames are not main-board answers. Reads only the header, so the
+     * first notify chunk of a frame is enough.
+     */
+    fun mainBoardCommandIndex(frame: ByteArray): Int? {
+        if (frame.size < 5) return null
+        val index = when (frame.u8(2) and FORMAT_MASK) {
+            FORMAT_PLAIN, FORMAT_ONE_TO_ONE -> 4
+            FORMAT_TARGET -> 5.takeIf { frame.u8(4) == HOST_ADDRESS }
+            FORMAT_SOURCE_TARGET, FORMAT_MANY_TO_MANY -> 6.takeIf {
+                frame.size > 5 && frame.u8(4) == MAIN_BOARD_ADDRESS && frame.u8(5) == HOST_ADDRESS
+            }
+            else -> null
+        }
+        return index?.takeIf { it < frame.size }
+    }
+
+    private const val FORMAT_MASK = 0x07
+    private const val FORMAT_PLAIN = 1
+    private const val FORMAT_TARGET = 2
+    private const val FORMAT_SOURCE_TARGET = 3
+    private const val FORMAT_ONE_TO_ONE = 4
+    private const val FORMAT_MANY_TO_MANY = 6
 }
 
 private fun ByteArray.u8(offset: Int): Int = this[offset].toInt() and 0xFF
@@ -1702,6 +2174,16 @@ private fun ByteArray.u8(offset: Int): Int = this[offset].toInt() and 0xFF
 private fun Int.bit(index: Int): Boolean = ((this ushr index) and 1) != 0
 
 private fun ByteArray.uint16Le(offset: Int): Int = u8(offset) or (u8(offset + 1) shl 8)
+
+/**
+ * Odometer in meters from a total-statistics answer: `u32 @0`, tens of meters (WheelLog's
+ * `parseTotalStats`, which also refuses answers under 20 bytes). Null for a short answer.
+ */
+private fun ByteArray.totalDistanceMeters(): Double? {
+    if (size < 20) return null
+    val raw = u8(0).toLong() or (u8(1).toLong() shl 8) or (u8(2).toLong() shl 16) or (u8(3).toLong() shl 24)
+    return raw * 10.0
+}
 
 private fun ByteArray.uint32Le(offset: Int): Int =
     u8(offset) or (u8(offset + 1) shl 8) or (u8(offset + 2) shl 16) or (u8(offset + 3) shl 24)
@@ -1721,15 +2203,42 @@ private fun ByteArray.pwmPercent(offset: Int): Double {
     return value.takeIf { it <= 200.0 } ?: Double.NaN
 }
 
+/**
+ * A temperature byte: **signed**, biased by `+80`, so the scale runs -48..207 C.
+ *
+ * This used to read the byte unsigned as `u8 + 80 - 256`, which is the same number only while
+ * the byte has its high bit set - that is, only below 80 C. Above it the reading fell off a
+ * cliff to -176 C and the wheel could never show more than 79. A P6 ridden hard
+ * (`loeuc_E17CC2C97F8B_unknown_20260916_221556.jsonl`) settles it: over 2807 realtime frames
+ * the motor byte climbs 219 -> 255 -> 0 -> 67 without a discontinuity anywhere in the ride,
+ * and only the signed reading turns that into one continuous 43 C -> 147 C climb. The rider
+ * reported a ceiling of 79 C, a -175 C, and a motor that really was around 140.
+ *
+ * It is also the bias the BMS block already used - `add #0x50` on a signed byte in the
+ * official app's parser, see `docs/inmotion-protocol-notes.md`.
+ */
 private fun ByteArray.temperature(offset: Int): Double {
     if (offset !in indices) {
         return Double.NaN
     }
-    return (u8(offset) + 80 - 256).toDouble()
+    return (int8(offset) + 80).toDouble()
 }
 
-private fun ByteArray.presentTemperature(offset: Int): Double {
-    return if (offset !in indices || u8(offset) == 0) Double.NaN else temperature(offset)
+/**
+ * The same reading, with the slots a wheel does not populate blanked.
+ *
+ * Raw zero is the absent marker on every slot but the motor's: on a P6 byte 60 (battery) is a
+ * hard zero in all 2807 frames of the capture above, while the live sensors move. The motor
+ * slot is the exception, because raw zero is exactly 80 C there and a working motor passes
+ * through it - the same capture holds seven consecutive frames of it between 79 C and 95 C,
+ * and blanking them took the reading off the rider's dashboard mid-climb.
+ */
+private fun ByteArray.presentTemperature(offset: Int, zeroIsPresent: Boolean = false): Double {
+    return if (offset !in indices || (!zeroIsPresent && u8(offset) == 0)) {
+        Double.NaN
+    } else {
+        temperature(offset)
+    }
 }
 
 private data class DiagnosticDefinition(
@@ -1748,48 +2257,48 @@ private fun warning(categoryEn: String, categoryRu: String, titleEn: String, tit
 
 private val DIAGNOSTIC_DEFINITIONS = listOf(
     error("Driver board", "Силовая плата", "Phase current sensor fault", "Ошибка датчика фазного тока"),
-    error("Driver board", "Силовая плата", "Bus current sensor fault", "Ошибка датчика тока шины"),
+    error("Driver board", "Силовая плата", "Bus current sensor fault", "Ошибка датчика тока батареи"),
     error("Motor", "Мотор", "Left Hall sensor fault", "Ошибка левого датчика Холла"),
     error("Motor", "Мотор", "Right Hall sensor fault", "Ошибка правого датчика Холла"),
     error("Battery", "Батарея", "Battery fault", "Ошибка батареи"),
-    error("Driver board", "Силовая плата", "IMU sensor fault", "Ошибка датчика IMU"),
+    error("Driver board", "Силовая плата", "IMU sensor fault", "Ошибка гироскопа (IMU)"),
     error("Communication", "Связь", "Driver board communication fault 1", "Ошибка связи с силовой платой 1"),
     error("Communication", "Связь", "Driver board communication fault 2", "Ошибка связи с силовой платой 2"),
-    error("Communication", "Связь", "HMIC communication fault 1", "Ошибка связи с HMIC 1"),
-    error("Communication", "Связь", "HMIC communication fault 2", "Ошибка связи с HMIC 2"),
-    error("Driver board", "Силовая плата", "MOS temperature sensor fault", "Ошибка датчика температуры MOS"),
+    error("Communication", "Связь", "HMIC communication fault 1", "Ошибка связи с платой экрана (HMIC) 1"),
+    error("Communication", "Связь", "HMIC communication fault 2", "Ошибка связи с платой экрана (HMIC) 2"),
+    error("Driver board", "Силовая плата", "MOS temperature sensor fault", "Ошибка датчика температуры мосфетов"),
     error("Motor", "Мотор", "Motor temperature sensor fault", "Ошибка датчика температуры мотора"),
-    error("Driver board", "Силовая плата", "Board hot-area sensor fault", "Ошибка датчика горячей зоны платы"),
+    error("Driver board", "Силовая плата", "Board hot-area sensor fault", "Ошибка датчика температуры платы"),
     error("Cooling", "Охлаждение", "Fan fault", "Ошибка вентилятора"),
-    error("HMIC", "HMIC", "HMIC RTC fault", "Ошибка часов RTC HMIC"),
-    error("HMIC", "HMIC", "HMIC flash fault", "Ошибка flash-памяти HMIC"),
-    error("Driver board", "Силовая плата", "Bus voltage sensor fault", "Ошибка датчика напряжения шины"),
+    error("HMIC", "Плата экрана", "HMIC RTC fault", "Сбой часов на плате экрана"),
+    error("HMIC", "Плата экрана", "HMIC flash fault", "Сбой памяти на плате экрана"),
+    error("Driver board", "Силовая плата", "Bus voltage sensor fault", "Ошибка датчика напряжения батареи на плате"),
     error("Battery", "Батарея", "Battery voltage sensor fault", "Ошибка датчика напряжения батареи"),
-    error("Battery", "Батарея", "Battery cannot power off", "Батарея не может отключиться"),
+    error("Battery", "Батарея", "Battery cannot power off", "Батарея не отключается"),
     error("Battery", "Батарея", "Battery cannot charge", "Батарея не может заряжаться"),
     warning("Battery", "Батарея", "Critically low battery", "Критически низкий заряд"),
     warning("Battery", "Батарея", "Battery overvoltage", "Перенапряжение батареи"),
     warning("Driver board", "Силовая плата", "Overcurrent", "Превышение тока"),
     warning("Battery", "Батарея", "Low battery", "Низкий заряд батареи"),
-    error("Battery", "Батарея", "Additional battery fault", "Дополнительная ошибка батареи"),
+    error("Battery", "Батарея", "Additional battery fault", "Ошибка батареи (вторая)"),
     warning("Motor", "Мотор", "Motor overtemperature", "Перегрев мотора"),
     warning("Temperature", "Температура", "Vehicle overtemperature", "Общий перегрев"),
-    warning("Driver board", "Силовая плата", "CPU overtemperature", "Перегрев CPU"),
-    warning("Driver board", "Силовая плата", "IMU overtemperature", "Перегрев IMU"),
-    warning("Safety", "Безопасность", "Locked because of a safety issue", "Блокировка из-за проблемы безопасности"),
+    warning("Driver board", "Силовая плата", "CPU overtemperature", "Перегрев процессора"),
+    warning("Driver board", "Силовая плата", "IMU overtemperature", "Перегрев гироскопа (IMU)"),
+    warning("Safety", "Безопасность", "Locked because of a safety issue", "Колесо заблокировано защитой"),
     warning("Safety", "Безопасность", "Overspeed", "Превышение скорости"),
-    warning("Motor", "Мотор", "Unexpected motor spin", "Непредусмотренное вращение мотора"),
+    warning("Motor", "Мотор", "Unexpected motor spin", "Мотор крутится, когда не должен"),
     warning("Motor", "Мотор", "Motor blocked", "Мотор заблокирован"),
     warning("Safety", "Безопасность", "Fall detected", "Обнаружено падение"),
-    warning("Safety", "Безопасность", "Risky riding behavior", "Опасное поведение при езде"),
-    warning("Motor", "Мотор", "Motor no-load protection", "Защита вращения мотора без нагрузки"),
-    warning("Safety", "Безопасность", "Required self-check not passed", "Не пройдена обязательная самопроверка"),
+    warning("Safety", "Безопасность", "Risky riding behavior", "Рискованная езда (предупреждение колеса)"),
+    warning("Motor", "Мотор", "Motor no-load protection", "Сработала защита: мотор крутился без нагрузки"),
+    warning("Safety", "Безопасность", "Required self-check not passed", "Колесо не прошло самопроверку"),
     warning("Controls", "Управление", "Power key held too long", "Слишком долгое нажатие кнопки питания"),
     warning("Battery", "Батарея", "Some batteries are not enabled", "Часть батарей не включена"),
     warning("Battery", "Батарея", "Battery calibration required", "Требуется калибровка батареи"),
-    warning("Compatibility", "Совместимость", "Software incompatible", "Несовместимое программное обеспечение"),
-    warning("Firmware", "Прошивка", "Functions limited by incomplete firmware update", "Функции ограничены из-за незавершенного обновления"),
-    warning("Safety", "Безопасность", "Remote lock active", "Активна удаленная блокировка"),
+    warning("Compatibility", "Совместимость", "Software incompatible", "Несовместимая прошивка"),
+    warning("Firmware", "Прошивка", "Functions limited by incomplete firmware update", "Обновление прошивки не завершено — часть функций отключена"),
+    warning("Safety", "Безопасность", "Remote lock active", "Колесо заблокировано удалённо"),
     warning("Compatibility", "Совместимость", "Hardware incompatible", "Несовместимое оборудование"),
     warning("Cooling", "Охлаждение", "Fan speed too low", "Слишком низкая скорость вентилятора"),
 )

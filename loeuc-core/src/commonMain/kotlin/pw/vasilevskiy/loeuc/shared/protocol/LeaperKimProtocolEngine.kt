@@ -37,6 +37,23 @@ data class LeaperKimTelemetry(
     val firmwareVersion: Double,
     val highSpeedMode: Boolean,
     val fieldWeakeningPercent: Double,
+    /**
+     * The speed word `@6` with the sign the wheel sends. [speedKmh] is its magnitude, which is
+     * what a dashboard wants; the sign is what a crash reconstruction wants.
+     */
+    val signedSpeedKmh: Double = Double.NaN,
+    /**
+     * The q-axis current `@16` with its sign. [phaseCurrent] is its magnitude; read against
+     * [signedSpeedKmh], opposite signs are drive and equal signs are braking on this firmware.
+     */
+    val signedPhaseCurrent: Double = Double.NaN,
+    /**
+     * The main-frame halfword `@38..39`, signed and unscaled. Reverse engineering reads it as the
+     * input (battery) current in tenths of an amp - zero on a parked wheel, tracking the phase
+     * current with the opposite sign while riding - but that reading is not confirmed, so the
+     * value is published raw. Absent on legacy 36-byte frames.
+     */
+    val inputCurrentRaw: Double = Double.NaN,
 )
 
 data class LeaperKimBmsCell(
@@ -75,6 +92,13 @@ data class LeaperKimSettingCapability(
     val minValue: Int,
     val maxValue: Int,
     val kind: String,
+    /**
+     * Base voltage, in whole volts, that `max_charge_voltage`'s raw adjustment is added to:
+     * `base + rawValue / 10` V. The wheel's own page 8 byte 65 when it reports one, otherwise
+     * the base known for this firmware build ([LeaperKimMaxChargeVoltage.baseVolts]). Null when
+     * neither knows it: a consumer then shows the adjustment alone, never a guessed voltage, and
+     * the telemetry max-charge voltage is NaN for the same frame.
+     */
     val baseValue: Int? = null,
     /**
      * False when the current wheel firmware doesn't report this field this cycle (raw byte
@@ -86,7 +110,21 @@ data class LeaperKimSettingCapability(
 )
 
 class LeaperKimProtocolEngine {
-    private var buffer = byteArrayOf()
+    private val reassembler = LeaperKimFrameReassembler()
+
+    /**
+     * The reassembled frames this link has seen, newest first.
+     *
+     * Kept because a frame carries more than telemetry: the tail the patched firmware hands to
+     * plugins is raw bytes no decoded value contains, and the only proof that a plugin is alive
+     * in the wheel's flash is that those bytes stopped being the sentinel. Android reads the same
+     * window out of its own capture store; this is where the other shell gets it, so both read
+     * one reassembly rather than two.
+     *
+     * Frames are kept whole, CRC32 trailer included, exactly as they arrived - offsets counted
+     * against a trimmed frame would be a second, quieter frame format.
+     */
+    private val recentFrames = ArrayDeque<ByteArray>()
     private var batteryPercent = Double.NaN
 
     /**
@@ -112,8 +150,12 @@ class LeaperKimProtocolEngine {
     private var highSpeedMode = false
     private var firmwareVersion = Double.NaN
 
+    /** The frame window, newest first. Empty until the first frame passes its CRC32. */
+    fun recentFrames(): List<ByteArray> = recentFrames.toList()
+
     fun reset() {
-        buffer = byteArrayOf()
+        reassembler.reset()
+        recentFrames.clear()
         batteryPercent = Double.NaN
         hasReportedBatteryPercent = false
         lastVoltage = Double.NaN
@@ -156,9 +198,11 @@ class LeaperKimProtocolEngine {
         "0070" -> "Patton-S"
         "0080" -> "Oryx"
         "0090" -> "Lynx-S"
+        "0100" -> "Sherman-P"
         "5010" -> "Apex"
         "5020" -> "Aero"
         "5030" -> "Aeon"
+        "5040" -> "Xeno"
         else -> null
     }
 
@@ -362,6 +406,37 @@ class LeaperKimProtocolEngine {
         ).withCrc32()
     }
 
+    /**
+     * ABI 6 built-in module call. Version is checked before dispatch by the firmware.
+     * Module ids run 1..13; 13 is configurable field weakening (Lynx-S b78).
+     */
+    @ExperimentalWriteApi
+    fun buildModuleCommandFrame(pluginId: Int, opcode: Int, value: Int, protocolVersion: Int): ByteArray {
+        require(pluginId in 1..13 && opcode in 0..255 && value in 0..65535)
+        require(protocolVersion in 1..255)
+        return byteArrayOf(
+            'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0x11, 0x01, PluginLoaderFamily.toByte(),
+            (0x40 + pluginId).toByte(), opcode.toByte(), 3,
+            value.toByte(), (value ushr 8).toByte(), protocolVersion.toByte(),
+        ).withCrc32()
+    }
+
+    /** Bounded bank erase/check, or the separately keyed settings reset on ABI 6. */
+    @ExperimentalWriteApi
+    fun buildModuleMaintenanceFrame(subcommand: Int, page: Int, portion: Int): ByteArray {
+        require(subcommand in listOf(1, 4, 5))
+        require(page in 0..31 && portion in 0..15)
+        val offset = if (subcommand == 1) page * 2048 else page
+        val value = if (subcommand == 5) 0x5E7A else if (subcommand == 4) portion else 0
+        return byteArrayOf(
+            'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0x10, 0x01, PluginLoaderFamily.toByte(),
+            (offset ushr 8).toByte(), offset.toByte(), subcommand.toByte(),
+            value.toByte(), (value ushr 8).toByte(),
+        ).withCrc32()
+    }
+
     @ExperimentalWriteApi
     fun buildFixedShutdownTimerCommand(): ByteArray {
         return byteArrayOf(
@@ -374,7 +449,7 @@ class LeaperKimProtocolEngine {
     }
 
     /**
-     * A settings-action frame that asks the wheel for nothing at all.
+     * The horn: an `0x16` action frame whose only effect is the tone the wheel sounds on receipt.
      *
      * Both spellings of the app's own `0x16` action packet, with every action slot left at the
      * `0x80` placeholder. The documented shapes are, pre-CRC:
@@ -382,34 +457,87 @@ class LeaperKimProtocolEngine {
      * ```text
      * fall protection angle  4C 64 41 70 16 01 00 80 80 80 80 80 80 80 80 80 80 <angle>
      * shutdown in 10 seconds 4C 64 41 70 16 01 00 80 80 80 80 80 80 80 80 80 01 80
-     * this frame             4C 64 41 70 16 01 00 80 80 80 80 80 80 80 80 80 80 80
+     * this frame             4C 64 41 70 16 63 00 80 80 80 80 80 80 80 80 80 80 80
      * ```
      *
-     * Why it does nothing. `LdApDecodedObjectHandler` takes the `body[1] == 0` branch, reads
-     * `body[11]` and passes it on: only `1` there arms the ten-second shutdown, and `0x80` does
-     * not. `body[12]` goes to the next setter, where `0x80` falls outside its range check. The
-     * remaining slots are placeholders in every documented command of this family. So the wheel
-     * parses the frame, dispatches it, and changes nothing.
+     * ## What makes the sound
      *
-     * Why it might be audible is a separate question, and one the firmware notes do not answer:
-     * the caller wants the wheel to acknowledge a received command the way Begode does, with a
-     * sound. That is the owner's reading of the dispatcher, not something this repository has
-     * traced to the tone call, and one press on a real wheel settles it either way. Nothing here
-     * depends on the answer - a wheel that stays silent has simply been told nothing.
+     * `packet[5]` is a beep request, and the dispatcher hands it to a decoder **before** it
+     * switches on `packet[6]` - so every `LdAp` frame sounds whatever that byte asks for, whatever
+     * command it turns out to carry. Traced in two images: `0x08011DF4` -> `0x0800DE94` on a NOSFET
+     * Aero `502.0.06`, `0x0801263C` -> `0x0800E064` on a LeaperKim Lynx-S `009.0.04`. The decoders
+     * are byte-identical and both tail-call the beeper.
+     *
+     * The byte is a two-decimal-digit spec, rejected outside `1..120`:
+     *
+     * ```text
+     * duration = (value - value % 10) * 5     raised to 25 when that lands below 50
+     * loudness = (value % 10) * 100           beeper clamps at 1023; the speed alarm uses 999
+     * ```
+     *
+     * This frame asks for [HornBeepCode] = 99: **450 ms at loudness 900**. Every other command in
+     * this engine sends [AckBeepCode] = 1 there, which is 50 ms at loudness 100 - the quietest tone
+     * the firmware can emit, and why a command acknowledgement is barely audible. Leave it that
+     * way: on the light and settings frames the chirp is an acknowledgement, and only here is it
+     * the point. Raising it elsewhere would make every setting write shout.
+     *
+     * ## Why not the vendor's own horn command
+     *
+     * The NOSFET app's horn button sends `BtManager.CMD_OLDCMDB`, `4C 6B 41 70 0E 00 80 80 80 01`
+     * plus CRC32, and that cannot be reused on a modern wheel. On an Aero no `LkAp` frame reaches
+     * the command dispatcher at all: `0x0801AD04` tests the marker and only the `LdAp` arm at
+     * `0x0801AD3A` continues to `0x0801AD4A b.w 0x08011DF4`. The Lynx-S image does not contain the
+     * string `LkAp` anywhere. The constant's own name says what it is - `OLDCMDb`, the horn for the
+     * wheels that predate this family.
+     *
+     * ## What the rest of the frame does
+     *
+     * Nothing to any wheel setting. The legacy short layout (`packet[6] == 0x00`, handler
+     * `0x08011E48`) feeds nine setters from the remaining slots and every one range-rejects `0x80`,
+     * `CFG+0x35` - the byte the speed alarm's threshold is derived from - included.
+     *
+     * It is **not** a no-op, and an earlier version of this comment saying so was wrong: two stores
+     * run ahead of any range check, `0x200002FC = 8` in the headlight setter and `0x200002FE = 3`
+     * in the beep decoder. Both are display/state bytes.
+     *
+     * ## The `LkAp` half, and a risk that was weighed and accepted
+     *
+     * The old spelling still goes out because on the wheels that predate `LdAp` it is the only
+     * thing that can arrive - and it keeps [AckBeepCode], because there `packet[5]` is part of the
+     * command's identity rather than a beep request (the vendor pairs it with the frame length to
+     * tell its commands apart), so those wheels get a silent horn.
+     *
+     * That frame is **one byte away from the vendor's "shut down in ten seconds" packet**:
+     * `CMD_SET_CLOSE_IN_10` is `LkAp 16 01` + ten `0x80` + `01 80`, and this is the same length and
+     * the same selector with `0x80` in that slot instead. The owner weighed that against dropping
+     * the old spelling and kept it (2026-09-21). If you edit this builder, slot 16 of the `LkAp`
+     * frame stays `0x80`.
      */
     @ExperimentalWriteApi
-    fun buildNoOpActionCommand(): ByteArray {
+    fun buildHornCommand(): ByteArray {
         val placeholders = ByteArray(11) { 0x80.toByte() }
         val oldCommand = byteArrayOf(
             'L'.code.toByte(), 'k'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
-            0x16, 0x01,
+            0x16, AckBeepCode,
         ) + placeholders + byteArrayOf(0x80.toByte())
         val newCommand = byteArrayOf(
             'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
-            0x16, 0x01, 0x00,
+            0x16, HornBeepCode, 0x00,
         ) + placeholders
         return oldCommand.withCrc32() + newCommand.withCrc32()
     }
+
+    /**
+     * The horn for the wheel this engine has seen: [buildHornCommand], or null where it cannot be
+     * dispatched.
+     *
+     * The four oldest hardware codes (see [usesTextLightCommand]) carry neither the `LkAp` nor
+     * the `LdAp` handler, so the frame would be silence to them and they get no horn at all. An
+     * unidentified wheel is treated like the newer ones, as it is for the light.
+     */
+    @ExperimentalWriteApi
+    fun hornCommand(): ByteArray? =
+        if (usesTextLightCommand()) null else buildHornCommand()
 
     /**
      * Whether the headlight can only be switched by the text command, because this wheel's
@@ -437,6 +565,106 @@ class LeaperKimProtocolEngine {
         else -> false
     }
 
+    /**
+     * Clear the wheel's trip meter - the distance the wheel itself counts since the last reset,
+     * not the app's own ride record.
+     *
+     * Both spellings, exactly as the vendor app sends them, pre-CRC:
+     *
+     * ```text
+     * LkAp FB 00 01
+     * LdAp 0D 00 02 80 01
+     * ```
+     *
+     * Two independent reads agree on these bytes:
+     *
+     * - The official app's own constants, `BtManager.CMD_CLEAR_METER` /
+     *   `CMD_CLEAR_METER_NEW`, sent together through `sendBytesDataCombine`, each CRC32-wrapped -
+     *   the same shape [buildLightCommand] already ships. Its only caller is the home screen's
+     *   "reset meter" button, behind a confirmation dialog and behind **no** speed or charging
+     *   gate (unlike the shutdown button right next to it, which the app blocks while moving).
+     * - The firmware itself. In the page-8 settings grammar decoded in
+     *   `docs/leaperkim-firmware-re-notes.md`, the frame's length byte is the setting id and a
+     *   value for id `N` lands at `body[N - 10]`. The new packet's `0x0D` is id 13, its
+     *   `body[1] == 0x02` selects that page-8 branch, and `applyPage8SettingsPacket` calls
+     *   `triggerClearTripOrCallback(body[3])` - which acts only on the value `1`, the byte this
+     *   packet puts there. Every other slot is the `0x80` placeholder its setter range-rejects.
+     *
+     * Nothing here is written to the persistent settings block: the handler at `0x08003BD0`
+     * calls one function pointer and stores nothing.
+     */
+    @ExperimentalWriteApi
+    fun buildClearTripCommand(): ByteArray {
+        val oldCommand = byteArrayOf(
+            'L'.code.toByte(), 'k'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0xFB.toByte(), 0x00, 0x01,
+        ).withCrc32()
+        val newCommand = byteArrayOf(
+            'L'.code.toByte(), 'd'.code.toByte(), 'A'.code.toByte(), 'p'.code.toByte(),
+            0x0D, 0x00, 0x02, 0x80.toByte(), 0x01,
+        ).withCrc32()
+        return oldCommand + newCommand
+    }
+
+    /**
+     * The trip reset for the wheel this engine has seen: [buildClearTripCommand], or null where
+     * it cannot be dispatched.
+     *
+     * Same gate as the horn and the light: the four oldest hardware codes (see
+     * [usesTextLightCommand]) carry neither the `LkAp` nor the `LdAp` handler, so the frame would
+     * be silence to them and they get no button at all. An unidentified wheel is treated like the
+     * newer ones.
+     */
+    @ExperimentalWriteApi
+    fun clearTripCommand(): ByteArray? =
+        if (usesTextLightCommand()) null else buildClearTripCommand()
+
+    /**
+     * The headlight for the wheel this engine has seen, in the direction asked for.
+     *
+     * **Off goes out twice**, as the frame and as the text. Both spellings reach the same
+     * light-mode byte on every image that has been read, and both write a plain zero there, so
+     * there is nothing for them to fight over and whichever one this wheel dispatches puts the
+     * light out. **On goes out as the frame alone**, because there the two are not always the
+     * same request - see the two images below.
+     *
+     * The reason for the pair is a rider on an old Lynx (`0050`) on 2026-09-29: with the frame
+     * alone going out, turning the headlight on worked and **nothing in the app would turn it
+     * off** - not the off button, not the software auto-light, which sends this same command with
+     * no state of its own in the way.
+     *
+     * Be clear about what this does and does not explain. The `005.0.13` image was disassembled
+     * afterwards and it says the frame's zero **must** put that light out: the frame is valid by
+     * length and CRC, its body[3] is the light slot, the range check there passes exactly 0 and 1,
+     * the byte is written as it arrives, and the periodic lamp driver clears the pin for any value
+     * but 1. So this pair is not a diagnosis. It is one extra write that removes the guess about
+     * which spelling lands, on a wheel where the rider could not put the light out at all.
+     *
+     * The two images differ, and only one of them has the dim/bright story:
+     *
+     * - Lynx-S `009.0.0x`: the frame's setter stores `v * 2`, so the frame means mode 2 and the
+     *   text means mode 1, and the light driver turns those into levels 190 and 60 - the bright
+     *   and the dim beam. Sending both spellings for **on** would be asking for two lights.
+     * - Old Lynx `005.0.05`..`005.0.13`: the frame's setter stores `v` as it arrives, rejects 2
+     *   and above, and the lamp is a plain on/off pin with no levels at all. Here the frame and
+     *   the text are the same request in both directions.
+     *
+     * The four oldest hardware codes ([usesTextLightCommand]) dispatch no frame at all and get
+     * the text in both directions, as they did before. On `005.0.04` it is the other way round -
+     * no frame path reaches the light byte there either - but that code is `0050` like the newer
+     * Lynx images, and this engine cannot tell the two apart from telemetry.
+     *
+     * Dual-beam wheels never come here for their low beam: on a Lynx-S or an Oryx the text *is*
+     * the low beam, and the platform shells route that button to [buildLeaperKimLowLightCommand]
+     * on its own.
+     */
+    @ExperimentalWriteApi
+    fun lightCommand(enabled: Boolean): ByteArray = when {
+        usesTextLightCommand() -> buildLeaperKimLowLightCommand(enabled = enabled)
+        enabled -> buildLightCommand(enabled = true)
+        else -> buildLightCommand(enabled = false) + buildLeaperKimLowLightCommand(enabled = false)
+    }
+
     @ExperimentalWriteApi
     fun buildLightCommand(enabled: Boolean): ByteArray {
         val value = if (enabled) 0x01 else 0x00
@@ -452,39 +680,29 @@ class LeaperKimProtocolEngine {
     }
 
     fun consume(chunk: ByteArray): LeaperKimTelemetry? {
-        buffer += chunk
         var latest: LeaperKimTelemetry? = null
 
-        while (true) {
-            val markerIndex = buffer.indexOfMarker()
-            if (markerIndex < 0) {
-                buffer = buffer.takeLast(2).toByteArray()
-                return latest
-            }
-            if (markerIndex > 0) {
-                buffer = buffer.copyOfRange(markerIndex, buffer.size)
-            }
-            if (buffer.size < 4) {
-                return latest
-            }
-
-            val frameLength = buffer.u8(3) + 4
-            if (buffer.size < frameLength) {
-                return latest
-            }
-            val frame = buffer.copyOfRange(0, frameLength)
-            buffer = buffer.copyOfRange(frameLength, buffer.size)
+        for (frame in reassembler.consume(chunk)) {
+            val frameLength = frame.size
 
             // Legacy Sherman/ShermanMax frames are 36 bytes with no CRC32 trailer. Nothing in the
             // newer format is anywhere near that short - Patton's page 3, the shortest CRC32 frame
             // observed, is 51 bytes - so the declared length alone separates the two formats.
             if (frameLength in LegacyFrameLengthRange) {
+                // No checksum on the 36-byte stream. Reject impossible duty/pose words before
+                // they can update BMS state, energy or ride maxima. LK5690's 2026-10-24 ride
+                // contains duty 19464 and pose 23584 (0x5C20, the tail of a new frame header).
+                if (frameLength != LegacyFrameSize || frame.uint16Be(34) > 10_000 ||
+                    abs(frame.int16Be(32)) > 18_000
+                ) continue
+                remember(frame)
                 latest = frame.toTelemetry(isLegacy = true)
                 continue
             }
             if (!frame.hasValidCrc32()) {
                 continue
             }
+            remember(frame)
             // Decode the payload only. Frame length is per-page and per-model: Lynx-S/Oryx send a
             // 87-byte page 2, Patton (hardware 0040, no Smart BMS) only 54, so offsets that are
             // payload on one model land in the CRC32 trailer on another. Every `size` guard and
@@ -493,6 +711,13 @@ class LeaperKimProtocolEngine {
             // instead of as four bytes of checksum noise.
             latest = frame.copyOfRange(0, frameLength - CRC32_SIZE).toTelemetry(isLegacy = false)
         }
+        return latest
+    }
+
+    /** Newest first, and only as deep as the page cycle: nine frames plus a little slack. */
+    private fun remember(frame: ByteArray) {
+        recentFrames.addFirst(frame)
+        while (recentFrames.size > RECENT_FRAME_WINDOW) recentFrames.removeLast()
     }
 
     private fun ByteArray.toTelemetry(isLegacy: Boolean): LeaperKimTelemetry? {
@@ -553,7 +778,7 @@ class LeaperKimProtocolEngine {
             settings = parseSettings()
             val adjustment = controlByte(64)
             if (adjustment != null) {
-                maxChargeVoltage = (controlByte(65) ?: 145) + adjustment / 10.0
+                maxChargeVoltage = LeaperKimMaxChargeVoltage.volts(maxChargeBase(), adjustment) ?: Double.NaN
             }
         }
         if (page == 5) {
@@ -574,7 +799,12 @@ class LeaperKimProtocolEngine {
         val phaseCurrent = abs(phaseCurrentRaw) / 10.0
         val outputRaw = uint16Be(34)
         val outputCurrent = phaseCurrent * outputRaw / 10_000.0
-        val flow = powerFlowSign(phaseCurrentRaw, speedRaw, TorqueSignConvention.AgreementIsBraking)
+        // Legacy Sherman Max and newer LeaperKim firmware use opposite torque axes.
+        // LK5690, 2026-10-24: positive speed/current during acceleration was incorrectly
+        // recorded as regeneration (1768.25 Wh over 47.6 km).
+        val convention = if (isLegacy) TorqueSignConvention.AgreementIsDriving
+            else TorqueSignConvention.AgreementIsBraking
+        val flow = powerFlowSign(phaseCurrentRaw, speedRaw, convention)
         return LeaperKimTelemetry(
             speedKmh = abs(speedRaw) / 10.0,
             pwmPercent = outputRaw / 100.0,
@@ -638,11 +868,17 @@ class LeaperKimProtocolEngine {
                 hardwareCode = hardwareCode,
                 firmwareVersion = firmwareVersion.takeIf { it.isFinite() }?.toInt(),
             ) ?: Double.NaN,
+            signedSpeedKmh = speedRaw / 10.0,
+            signedPhaseCurrent = phaseCurrentRaw / 10.0,
+            inputCurrentRaw = if (isLegacy) Double.NaN else int16BeOrNull(38)?.toDouble() ?: Double.NaN,
         )
     }
 
     private fun ByteArray.parseSettings(): List<LeaperKimSettingCapability> {
-        val baseVol = u8OrNull(65)
+        // The same sentinel rule as every other page-8 byte. Reading 0x80 as a base of 128 V put
+        // a NOSFET Apex's stock 151.2 V (raw 62) on screen as 134.2 V. The telemetry max-charge
+        // voltage resolves the base through the same call, so the two always agree.
+        val baseVol = maxChargeBase()
         return SettingDefinitions.map { definition ->
             // 0x80 is the wire "field not reported this cycle" sentinel. Every defined field
             // is always exposed (matching Android's WheelSettingCapability list) - a missing
@@ -670,7 +906,7 @@ class LeaperKimProtocolEngine {
                 maxValue = definition.maxValue,
                 kind = definition.kind,
                 baseValue = if (definition.key == "max_charge_voltage") baseVol else null,
-                isSupported = raw != null,
+                isSupported = raw != null && !definition.isHidden,
             )
         }
     }
@@ -723,10 +959,15 @@ class LeaperKimProtocolEngine {
             2 -> readCells(startIndex = 15, sourceOffset = 53, maxCount = 15)
             3 -> {
                 repeat(6) { index ->
-                    int16BeOrNull(47 + index * 2)
+                    val temperature = int16BeOrNull(47 + index * 2)
                         ?.div(100.0)
                         ?.takeIf { it in -40.0..120.0 }
-                        ?.let { batteryTemperatures[batteryIndex][index + 1] = it }
+                        ?: return@repeat
+                    val previous = batteryTemperatures[batteryIndex][index + 1]
+                    // A sensor cannot instantly fall from a warm pack to exactly zero.
+                    // Keep real freezing temperatures, including a gradual crossing of 0 C.
+                    if (temperature == 0.0 && previous != null && abs(previous) > 5.0) return@repeat
+                    batteryTemperatures[batteryIndex][index + 1] = temperature
                 }
                 readCells(startIndex = 30, sourceOffset = 59, maxCount = 6)
                 if (expectedCount > 36) {
@@ -764,6 +1005,10 @@ class LeaperKimProtocolEngine {
         return (first shl 16) or (second shl 8) or third
     }
 
+    /** Page 8's max-charge base: reported, or known for this frame's firmware, or null. */
+    private fun ByteArray.maxChargeBase(): Int? =
+        LeaperKimMaxChargeVoltage.baseVolts(controlByte(65), readFirmwareVersion())
+
     private fun ByteArray.controlByte(offset: Int): Int? =
         u8OrNull(offset)?.takeUnless { it == 0x80 }
 
@@ -778,8 +1023,8 @@ class LeaperKimProtocolEngine {
             // Known defect, tracked separately: NosfetAeroTable tops out at 123.75 V (4.125 V per
             // cell), below Patton's real 126.0 V full charge, so the top ~9% of the pack reads as
             // a flat 100%. See docs/leaperkim-lynxs-protocol.md.
-            "0070", "5020", "0040" -> 30
-            "0080" -> 42
+            "0070", "5020", "5040", "0040" -> 30
+            "0080", "0100" -> 42
             // Sherman-s (0030) joins the 24S Shermans on the evidence of dump
             // loeuc_882583F51F81_unknown_20260819_220233.jsonl (device LK8435, firmware 3015),
             // which idles at 100.86 V on a pack its rider reports as fully charged: 4.2025 V per
@@ -866,11 +1111,16 @@ private val LeaperKimBmsProfiles = mapOf(
     "0070" to LeaperKimBmsProfile("leaperkim_0070", "Patton-S", 2, 30, 4),
     "0080" to LeaperKimBmsProfile("leaperkim_0080", "Oryx", 2, 42, 6),
     "0090" to LeaperKimBmsProfile("leaperkim_0090", "Lynx-S", 2, 36, 4),
+    // Sherman-P 010.0.02: 42S6P / 4700 Wh, same modern LeaperKim page layout.
+    "0100" to LeaperKimBmsProfile("leaperkim_0100", "Sherman-P", 2, 42, 6),
     // Nosfet, from the same catalogue: Apex 36s4p / 2700 Wh, Aero 30s2p / 1110 Wh,
     // Aeon 36s2p / 1350 Wh. Apex and Aero were already right; Aeon carried 4.
+    // Xeno 30s4p / 2200 Wh at 126 V. 5040 is the Xeno because its firmware clamps the charge
+    // voltage to a 30s pack and the only other 30s NOSFET, the Aero, is 5020.
     "5010" to LeaperKimBmsProfile("nosfet_5010", "Nosfet Apex", 2, 36, 4),
     "5020" to LeaperKimBmsProfile("nosfet_5020", "Nosfet Aero", 2, 30, 2),
     "5030" to LeaperKimBmsProfile("nosfet_5030", "Nosfet Aeon", 2, 36, 2),
+    "5040" to LeaperKimBmsProfile("nosfet_5040", "Nosfet Xeno", 2, 30, 4),
 )
 
 private val NosfetApexTable = intArrayOf(
@@ -932,13 +1182,20 @@ private data class SettingDefinition(
      * "not reported" sentinel, so reading it published 22.0 degrees of pedal trim on a level wheel.
      */
     val isDerived: Boolean = false,
+    /**
+     * True for a setting that is kept out of every settings list on purpose. It stays in the
+     * catalogue, so the full capability list keeps its shape and the byte is still decoded, but
+     * it is always reported as `isSupported = false` - the flag every consumer already filters
+     * on - and therefore is never displayed, offered to an alert command, or written.
+     */
+    val isHidden: Boolean = false,
 )
 
 private val SettingDefinitions = listOf(
-    SettingDefinition("pedal_hardness", "Pedal hardness / ride mode", "Жесткость педалей / режим езды", 50, 15, 0, 100),
-    SettingDefinition("stop_speed", "Tiltback speed", "Скорость tiltback", 52, 17, 10, 120),
-    SettingDefinition("stop_power", "PWM threshold", "Порог PWM", 53, 18, 30, 100),
-    SettingDefinition("speed_alarm", "Alarm speed", "Скорость тревоги", 54, 19, 10, 120),
+    SettingDefinition("pedal_hardness", "Pedal hardness / ride mode", "Жёсткость педалей", 50, 15, 0, 100),
+    SettingDefinition("stop_speed", "Tiltback speed", "Тилтбэк по скорости", 52, 17, 10, 120),
+    SettingDefinition("stop_power", "PWM threshold", "Тилтбэк по ШИМ", 53, 18, 30, 100),
+    SettingDefinition("speed_alarm", "Alarm speed", "Скоростной аларм", 54, 19, 10, 120),
     SettingDefinition("screen_backlight", "Screen backlight", "Подсветка экрана", 55, 20, 0, 100),
     // commandId is deliberately null (not "we haven't found the write command yet"):
     // LoEUC never exposes gyroscope calibration as something an app control (settings
@@ -951,30 +1208,21 @@ private val SettingDefinitions = listOf(
     // writableCommandCapabilities, and the writeSpec = null LeaperKimAnalysis.kt entry
     // on the Android side.
     SettingDefinition("gyro_calibration", "Gyro calibration", "Калибровка гироскопа", 56, null, 0, 255),
-    SettingDefinition("transport_mode", "Transport mode", "Транспортировочный режим", 57, 22, 0, 1, "toggle"),
+    SettingDefinition("transport_mode", "Transport mode", "Транспортный режим", 57, 22, 0, 1, "toggle"),
     SettingDefinition("unit", "Units", "Единицы", 58, 23, 0, 1, "unit"),
-    SettingDefinition("voltage_correction", "Voltage correction", "Коррекция напряжения", 59, 24, -15, 15),
-    SettingDefinition("low_voltage_mode", "Low battery mode", "Режим низкой батареи", 60, 25, 0, 1, "toggle"),
+    SettingDefinition("voltage_correction", "Voltage correction", "Поправка измерения напряжения", 59, 24, -15, 15),
+    SettingDefinition("low_voltage_mode", "Low battery mode", "Старт на низкой батарее", 60, 25, 0, 1, "toggle"),
     SettingDefinition("high_speed_mode", "High speed mode", "Высокоскоростной режим", 61, 26, 0, 1, "toggle"),
     SettingDefinition("angle_trim", "Pedal angle trim", "Угол педалей", 0, 16, -80, 80, isDerived = true),
     SettingDefinition("key_tone", "Button tone volume", "Громкость кнопок", 63, 28, 0, 100),
     SettingDefinition("max_charge_voltage", "Max charge voltage", "Макс. напряжение зарядки", 64, 29, 0, 120),
-    SettingDefinition("acc_dec_helper", "Acceleration/deceleration assist", "Помощь разгона/торможения", 66, 31, 0, 100),
-    SettingDefinition("acc_reduction", "Accelerometer reduction", "Снижение акселерометра", 68, 33, 0, 100),
-    SettingDefinition("brake_overpressure_alarm", "Brake overpressure alarm", "Тревога давления торможения", 69, 34, 80, 125),
+    SettingDefinition("acc_dec_helper", "Acceleration/deceleration assist", "Помощь при разгоне и торможении", 66, 31, 0, 100),
+    SettingDefinition("acc_reduction", "Accelerometer reduction", "CrazyLevel (ослабление акселерометра)", 68, 33, 0, 100),
+    // Hidden (product decision, 2026-09-21): the name is a literal rendering of the vendor app's
+    // label, no handler for id 34 was found in the firmware, and nobody can say what the value
+    // does. A writable row with unknown meaning is worse than no row.
+    SettingDefinition("brake_overpressure_alarm", "Brake overpressure alarm", "Тревога давления торможения", 69, 34, 80, 125, isHidden = true),
 )
-
-private fun ByteArray.indexOfMarker(): Int {
-    for (index in 0..size - 3) {
-        if (this[index] == 0xDC.toByte() &&
-            this[index + 1] == 0x5A.toByte() &&
-            this[index + 2] == 0x5C.toByte()
-        ) {
-            return index
-        }
-    }
-    return -1
-}
 
 private fun ByteArray.u8(offset: Int): Int = this[offset].toInt() and 0xFF
 
@@ -1021,6 +1269,28 @@ private fun ByteArray.withCrc32(): ByteArray {
  */
 private const val MotorProbeCeilingCelsius = 220.0
 
+/**
+ * The beep every command but the horn asks for: 50 ms at loudness 100 of 1023.
+ *
+ * `packet[5]` of an `LdAp` frame is a two-decimal-digit beep request - tens pick the duration,
+ * units pick the loudness in hundreds - and the wheel sounds it before it even looks at which
+ * command the frame carries. See [LeaperKimProtocolEngine.buildHornCommand] for the decode. The
+ * vendor app puts `1` here on every command it sends, so a setting write or a light toggle is
+ * acknowledged with the quietest tone the firmware has. That is the right level for an
+ * acknowledgement; do not raise it.
+ */
+private const val AckBeepCode: Byte = 0x01
+
+/**
+ * The horn's beep: 450 ms at loudness 900 of 1023, the longest and loudest the two-digit spec can
+ * ask for (`99` -> duration `90 * 5`, loudness `9 * 100`).
+ *
+ * Chosen 2026-09-21 because the horn exists to be heard by a pedestrian, and the
+ * acknowledgement-level [AckBeepCode] the button shipped with was 100 of 1023 - audible to the
+ * rider at a standstill and to nobody else.
+ */
+private const val HornBeepCode: Byte = 0x63
+
 /** The command family the plugin receiver answers to; stock firmware ignores it. */
 private const val PluginLoaderFamily = 0x61
 private const val PluginLoaderUnlock = 0
@@ -1051,6 +1321,14 @@ private const val PluginSlotBytes = 4096
 private const val MagicHalfwords = 2
 
 private const val CRC32_SIZE = 4
+
+/**
+ * How deep the kept frame window is. The stock page cycle is eight pages plus the plugin page,
+ * so anything shorter than nine could miss the page a plugin writes into. A host that sends a
+ * second plugin page now and then sends it in the first page's turn, which puts two of those
+ * turns, eighteen frames, between two first pages; the window covers that.
+ */
+private const val RECENT_FRAME_WINDOW = 24
 private const val LegacyFrameSize = 36
 private val LegacyFrameLengthRange = 20..46
 

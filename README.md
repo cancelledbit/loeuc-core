@@ -30,7 +30,7 @@ library retains, and where the threading and clock boundaries are.
 | --- | --- | --- |
 | Begode | `Begode` | Legacy and modern frames, per-cell battery curve, firmware family (stock, Freestyl3r, SmirnoV), settings rows |
 | KingSong | `KingSong` | Telemetry, BMS pages, identity, settings with writes |
-| InMotion | `Inmotion` | V11/V12/V13/V14/P6 telemetry, BMS, diagnostics, settings block |
+| InMotion | `Inmotion` | V11/V12/V13/V14/P6 telemetry, BMS, diagnostics, settings block; X1 telemetry, BMS and diagnostics (read-only) |
 | InMotion V5/V8/V10 | `InmotionLegacy` | Older CAN-over-BLE protocol (also Solowheel Glide 3): telemetry, identity, settings with writes. Silent until asked - drive `WheelSession.nextRequest` |
 | Leaperkim | `LeaperKim` | Lynx S / Patton pages, BMS, settings, diagnostic co-stream |
 | NOSFET | `Nosfet` | Aero, Aeon, Apex and Xeno speak the Leaperkim protocol; same engine, separate identity |
@@ -71,6 +71,9 @@ continuous tone in six lines of output.
   and rules engine. No dependencies beyond the Kotlin standard library.
 - `loeuc-coroutines` - one adapter that turns a `Flow<ByteArray>` transport into a flow of typed
   frames. Optional, and the only place kotlinx-coroutines appears.
+- `loeuc-extension-api` - the contract for Android apps that extend the LoEUC app: AIDL, the
+  manifest an extension declares and the rules the host holds it to. Android only, and the one
+  artifact published by coordinates (JitPack). See [docs/extensions.md](docs/extensions.md).
 
 Targets: JVM, Android (host tests), `iosArm64`, `iosSimulatorArm64`.
 
@@ -122,9 +125,16 @@ that share a frame - `WheelSession.writeSetting` builds it from the session's ow
 when (val result = session.writeSetting(key, value)) {
     is SettingWriteResult.Send -> { send(result.command.bytes); result.readbacks.forEach(::send) } // KingSong
     is SettingWriteResult.Queued -> Unit     // legacy InMotion: leaves through nextRequest, then re-reads
-    is SettingWriteResult.Rejected -> show(result.reason)
+    is SettingWriteResult.Rejected -> show(result.refusal.text(isRu = interfaceIsRussian))
 }
 ```
+
+A refusal is shown to the rider, so `SettingWriteResult.Rejected`, `KingSongSettingWrite.Rejected`
+and `InmotionLegacySettingWrite.Rejected` carry a `SettingWriteRefusal` - the same sentence in
+`english` and `russian`, picked with `text(isRu)`. `reason` is still there and is the English
+wording, for a log line or a test. (Before 0.x this was a single `reason: String` in English;
+a consumer that constructed one itself has to build a `SettingWriteRefusal` instead, which the
+compiler points at rather than letting English reach a Russian interface unnoticed.)
 
 `TelemetryUpdate.settings` marks which keys are `writable`; the brand's settings catalogue
 (`KingSongSettingsCatalog`, `InmotionLegacySettingsCatalog`, `BegodeSettingsCatalog`) has the titles,

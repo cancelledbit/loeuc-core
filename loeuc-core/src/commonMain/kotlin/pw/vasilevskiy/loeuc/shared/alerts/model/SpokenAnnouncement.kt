@@ -27,5 +27,7 @@ data class SpokenAnnouncement(
      * Takes the language explicitly: the phrase is the rider's own text, but the unit word and
      * the decimal separator have to agree with it.
      */
-    fun text(isRu: Boolean): String = AnnouncementComposer.compose(phrase, metric, value, isRu)
+    fun text(isRu: Boolean): String = AnnouncementComposer.compose(
+        phrase.ifBlank { MetricSpeech.defaultPhrase(metric, isRu) }, metric, value, isRu,
+    )
 }

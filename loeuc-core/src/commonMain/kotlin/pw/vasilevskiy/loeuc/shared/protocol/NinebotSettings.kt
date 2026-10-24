@@ -98,7 +98,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_lock_mode",
             titleEn = "Lock mode",
-            titleRu = "Режим блокировки",
+            titleRu = "Замок колеса",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.LockMode,
             kind = "toggle",
@@ -108,7 +108,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_limited_mode",
             titleEn = "Speed limit mode",
-            titleRu = "Режим ограничения скорости",
+            titleRu = "Ограничение скорости",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.LimitedMode,
             kind = "toggle",
@@ -119,7 +119,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_limited_speed",
             titleEn = "Speed limit",
-            titleRu = "Ограничение скорости",
+            titleRu = "Ограничение скорости, км/ч",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.LimitedSpeed,
             kind = "slider",
@@ -145,7 +145,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_alarm_1_enabled",
             titleEn = "Speed alarm 1",
-            titleRu = "Сигнал скорости 1",
+            titleRu = "Скоростной аларм 1",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.Alarms,
             kind = "toggle",
@@ -156,7 +156,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_alarm_2_enabled",
             titleEn = "Speed alarm 2",
-            titleRu = "Сигнал скорости 2",
+            titleRu = "Скоростной аларм 2",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.Alarms,
             kind = "toggle",
@@ -167,7 +167,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_alarm_3_enabled",
             titleEn = "Speed alarm 3",
-            titleRu = "Сигнал скорости 3",
+            titleRu = "Скоростной аларм 3",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.Alarms,
             kind = "toggle",
@@ -178,7 +178,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_alarm_1_speed",
             titleEn = "Speed alarm 1 threshold",
-            titleRu = "Порог сигнала 1",
+            titleRu = "Скоростной аларм 1, км/ч",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.Alarm1Speed,
             kind = "slider",
@@ -190,7 +190,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_alarm_2_speed",
             titleEn = "Speed alarm 2 threshold",
-            titleRu = "Порог сигнала 2",
+            titleRu = "Скоростной аларм 2, км/ч",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.Alarm2Speed,
             kind = "slider",
@@ -202,7 +202,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_alarm_3_speed",
             titleEn = "Speed alarm 3 threshold",
-            titleRu = "Порог сигнала 3",
+            titleRu = "Скоростной аларм 3, км/ч",
             blockBase = NinebotParam.LockMode,
             paramId = NinebotParam.Alarm3Speed,
             kind = "slider",
@@ -317,7 +317,7 @@ internal object NinebotSettingsCatalog {
         NinebotSettingRow(
             key = "ninebot_handle_button",
             titleEn = "Handle button",
-            titleRu = "Кнопка ручки",
+            titleRu = "Кнопка на ручке",
             blockBase = NinebotParam.LedMode,
             paramId = NinebotParam.DriveFlags,
             kind = "toggle",

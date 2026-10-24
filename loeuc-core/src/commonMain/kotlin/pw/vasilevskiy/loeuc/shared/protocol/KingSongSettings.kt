@@ -1,6 +1,7 @@
 package pw.vasilevskiy.loeuc.shared.protocol
 
 import pw.vasilevskiy.loeuc.shared.api.ExperimentalWriteApi
+import pw.vasilevskiy.loeuc.shared.api.SettingWriteRefusal
 
 /**
  * The KingSong settings the wheel has reported back, each `null` until it has.
@@ -266,7 +267,13 @@ data class KingSongSettingOption(
 /** What a settings write resolved to. */
 sealed interface KingSongSettingWrite {
     class Command(val bytes: ByteArray) : KingSongSettingWrite
-    data class Rejected(val reason: String) : KingSongSettingWrite
+    /**
+     * Nothing was built. [refusal] carries the wording in both languages; [reason] is the
+     * English one, for a log line or a test.
+     */
+    data class Rejected(val refusal: SettingWriteRefusal) : KingSongSettingWrite {
+        val reason: String get() = refusal.english
+    }
 }
 
 /**
@@ -328,7 +335,12 @@ object KingSongSettingsCatalog {
         Alarm1SpeedKey, Alarm2SpeedKey, Alarm3SpeedKey, MaxSpeedKey -> speedAlarmsWrite(key, value, state)
         PedalModeKey -> KingSongPedalMode.entries.firstOrNull { it.wire == value }
             ?.let { KingSongSettingWrite.Command(KingSongSettingsWriter.pedalMode(it)) }
-            ?: KingSongSettingWrite.Rejected("Unknown pedal mode $value.")
+            ?: KingSongSettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "Unknown pedal mode $value.",
+                    russian = "Неизвестный режим педалей $value.",
+                ),
+            )
         LightModeKey -> KingSongLightMode.entries.getOrNull(value)
             ?.let {
                 // Unknown voice switch: send what WheelLog sends, which is also what the wheels
@@ -337,22 +349,37 @@ object KingSongSettingsCatalog {
                     KingSongSettingsWriter.lightMode(it, voicePromptsOff = state.voicePromptsOff ?: true),
                 )
             }
-            ?: KingSongSettingWrite.Rejected("Unknown light mode $value.")
+            ?: KingSongSettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "Unknown light mode $value.",
+                    russian = "Неизвестный режим света $value.",
+                ),
+            )
         LedStripKey -> KingSongSettingWrite.Command(KingSongSettingsWriter.ledStrip(on = value != 0))
         StrobeKey -> KingSongSettingWrite.Command(KingSongSettingsWriter.strobe(on = value != 0))
         StandbyDelayKey ->
             if (value in 0..MAX_STANDBY_MINUTES) {
                 KingSongSettingWrite.Command(KingSongSettingsWriter.standbyDelay(seconds = value * 60))
             } else {
-                KingSongSettingWrite.Rejected("Standby delay must be 0..$MAX_STANDBY_MINUTES minutes.")
+                KingSongSettingWrite.Rejected(
+                    SettingWriteRefusal(
+                        english = "Standby delay must be 0..$MAX_STANDBY_MINUTES minutes.",
+                        russian = "Автоотключение — от 0 до $MAX_STANDBY_MINUTES минут.",
+                    ),
+                )
             }
         ChargeLimitKey ->
             if (value in KingSongSettingsWriter.MIN_CHARGE_LIMIT_PERCENT..100) {
                 KingSongSettingWrite.Command(KingSongSettingsWriter.chargeLimit(value))
             } else {
-                KingSongSettingWrite.Rejected("Charge limit must be 50..100 %.")
+                KingSongSettingWrite.Rejected(
+                    SettingWriteRefusal(
+                        english = "Charge limit must be 50..100 %.",
+                        russian = "Предел зарядки — от 50 до 100 %.",
+                    ),
+                )
             }
-        else -> KingSongSettingWrite.Rejected("Unknown KingSong setting $key.")
+        else -> KingSongSettingWrite.Rejected(SettingWriteRefusal.unknownSetting(key))
     }
 
     /**
@@ -369,20 +396,40 @@ object KingSongSettingsCatalog {
         val alarm3 = state.alarm3SpeedKmh
         val max = state.maxSpeedKmh
         if (alarm1 == null || alarm2 == null || alarm3 == null || max == null) {
-            return KingSongSettingWrite.Rejected("The wheel has not reported its current speed alarms yet.")
+            return KingSongSettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "The wheel has not reported its current speed alarms yet.",
+                    russian = "Колесо ещё не прислало текущие скоростные алармы. Подождите пару секунд и повторите.",
+                ),
+            )
         }
         if (value !in 0..KingSongSettingsWriter.MAX_SPEED_CEILING_KMH) {
-            return KingSongSettingWrite.Rejected("Speed must be 0..${KingSongSettingsWriter.MAX_SPEED_CEILING_KMH} km/h.")
+            return KingSongSettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "Speed must be 0..${KingSongSettingsWriter.MAX_SPEED_CEILING_KMH} km/h.",
+                    russian = "Скорость: от 0 до ${KingSongSettingsWriter.MAX_SPEED_CEILING_KMH} км/ч.",
+                ),
+            )
         }
         val a1 = if (key == Alarm1SpeedKey) value else alarm1
         val a2 = if (key == Alarm2SpeedKey) value else alarm2
         val a3 = if (key == Alarm3SpeedKey) value else alarm3
         val m = if (key == MaxSpeedKey) value else max
         if (a1 > a2 || a2 > a3) {
-            return KingSongSettingWrite.Rejected("Speed alarms must not decrease from the first to the third.")
+            return KingSongSettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "Speed alarms must not decrease from the first to the third.",
+                    russian = "Алармы должны идти по возрастанию: первый ≤ второй ≤ третий.",
+                ),
+            )
         }
         if (m != 0 && a3 > m) {
-            return KingSongSettingWrite.Rejected("Speed alarms must not exceed the tilt-back speed.")
+            return KingSongSettingWrite.Rejected(
+                SettingWriteRefusal(
+                    english = "Speed alarms must not exceed the tilt-back speed.",
+                    russian = "Алармы не могут быть выше скорости тилтбэка.",
+                ),
+            )
         }
         return KingSongSettingWrite.Command(KingSongSettingsWriter.speedAlarms(a1, a2, a3, m))
     }

@@ -133,31 +133,71 @@ class KingSongProtocolEngineTest {
         assertTrue(telemetry.isLegacy)
     }
 
+    /**
+     * The live temperature is the `0xA9` sensor and stays the `0xA9` sensor: a `0xB9` frame
+     * arriving between two live frames fills the secondary slot and must not touch the one the
+     * dashboard reads. Both frames arrive at ~2 Hz, so a slot that took either sensor flipped
+     * the displayed reading several times a second.
+     */
     @Test
-    fun rideStatsTemperatureWinsAndStopsTheTwoSensorsFromFlipping() {
+    fun theTwoSensorsKeepTheirOwnSlots() {
         val engine = KingSongProtocolEngine()
         val live = kingSongFrame(command = 0xA9).apply { putUInt16Le(offset = 12, value = 2_800) }
         val stats = kingSongFrame(command = 0xB9).apply { putInt16Le(offset = 14, value = 2_400) }
 
-        engine.consume(live)
+        val afterLive = requireNotNull(engine.consume(live))
         val afterStats = requireNotNull(engine.consume(stats))
         val afterSecondLive = requireNotNull(engine.consume(live))
 
-        assertEquals(24.0, afterStats.temperature, 0.0001)
-        // The whole point: a second 0xA9 must not drag the reading back to its own sensor.
-        assertEquals(24.0, afterSecondLive.temperature, 0.0001)
-        assertEquals(28.0, afterSecondLive.secondaryTemperature, 0.0001)
+        assertEquals(28.0, afterLive.temperature, 0.0001)
+        assertEquals(28.0, afterStats.temperature, 0.0001)
+        assertEquals(24.0, afterStats.motorTemperature, 0.0001)
+        assertEquals(28.0, afterSecondLive.temperature, 0.0001)
+        assertEquals(24.0, afterSecondLive.motorTemperature, 0.0001)
     }
 
+    /**
+     * The two sensors off a real wheel, one frame each, taken from a KSN-S18Pro+ capture
+     * (`loeuc_CD3430395851_unknown_20260913_192055.jsonl`) at the hottest point of its ride.
+     *
+     * The wheel started the capture cold at 16-17 C on both sensors and stood still for five
+     * minutes; ~70 s of riding later `0xA9` read 24 C and `0xB9` 21 C. The pair is what pins the
+     * mapping down: the sensor that gains seven degrees in a minute under load is the controller,
+     * and it is `0xA9` - the same one WheelLog publishes as the wheel's temperature.
+     */
     @Test
-    fun liveTemperatureStandsInUntilRideStatsArrive() {
+    fun realCaptureFramesPutTheHotterSensorInTheLiveSlot() {
+        val engine = KingSongProtocolEngine()
+        val live = "AA 55 9D 1C 4B 05 4B 00 79 DF D2 08 60 09 00 E0 A9 14 5A 5A".hexToByteArray()
+        val stats = "AA 55 00 00 41 00 09 02 B9 05 14 01 00 00 34 08 B9 14 5A 5A".hexToByteArray()
+
+        engine.consume(live)
+        val telemetry = requireNotNull(engine.consume(stats))
+
+        assertEquals(73.25, telemetry.voltage, 0.0001)
+        assertEquals(13.55, telemetry.speedKmh, 0.0001)
+        assertEquals(22.58, telemetry.current, 0.0001)
+        assertEquals(24.0, telemetry.temperature, 0.0001)
+        assertEquals(21.0, telemetry.motorTemperature, 0.0001)
+        assertEquals(65.0, telemetry.tripDistanceMeters, 0.0001)
+        assertEquals(521.0, telemetry.rideTimeSeconds, 0.0001)
+        assertEquals(false, telemetry.fanRunning)
+        assertEquals(false, telemetry.charging)
+    }
+
+    /**
+     * A wheel that has not answered `0xB9` yet still reports its temperature, and the secondary
+     * slot stays empty rather than echoing the live one under a second name.
+     */
+    @Test
+    fun liveFrameAloneCarriesTheTemperature() {
         val engine = KingSongProtocolEngine()
         val live = kingSongFrame(command = 0xA9).apply { putUInt16Le(offset = 12, value = 2_800) }
 
         val telemetry = requireNotNull(engine.consume(live))
 
         assertEquals(28.0, telemetry.temperature, 0.0001)
-        assertEquals(28.0, telemetry.secondaryTemperature, 0.0001)
+        assertTrue(telemetry.motorTemperature.isNaN())
     }
 
     @Test
@@ -466,6 +506,31 @@ class KingSongExtendedBmsTest {
 
         assertEquals(33.0, telemetry.pwmPercent, 0.0001)
         assertTrue(engine.bmsPacks().isEmpty())
+    }
+
+    @Test
+    fun aBmsThatLeavesChargeAndCapacityBlankIsReadFromItsCells() {
+        // A KS-14D Pro capture: 16 cells near 4.05 V, pack at 64.76 V, and the charge,
+        // capacity and cycle fields all zero. Taking that zero as a charge showed 0 % on a
+        // pack sitting near 90 %.
+        val frame = (
+            "AA 55 00 00 00 00 00 00 00 00 00 00 00 00 00 4F F1 D0 5A 5A 00 10 D2 0F D0 0F CC 0F " +
+                "CE 0F D2 0F D0 0F CF 0F D4 0F D0 0F D2 0F D3 0F D2 0F D0 0F D3 0F D3 0F C3 0F 08 " +
+                "AE 0B AE 0B 00 00 00 00 00 00 00 00 AE 0B 86 0B F4 FF 4C 19 00 00 00 00 00 00 00 " +
+                "00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+            ).hexToByteArray()
+
+        val pack = decodeKingSongBmsPacks(listOf(frame)).single()
+
+        assertEquals(16, pack.cells.size)
+        assertEquals(64.76, requireNotNull(pack.voltage), 0.0001)
+        assertNull(pack.reportedChargePercent)
+        assertNull(pack.factoryAh)
+        assertNull(pack.remainingAh)
+        assertNull(pack.chargeCycles)
+        val expected = CellChargeCurve.percentFromCellVoltage(pack.cells.average())
+        assertEquals(expected, requireNotNull(pack.chargePercent), 0.0001)
+        assertTrue(requireNotNull(pack.chargePercent) in 85.0..92.0, "charge ${pack.chargePercent}")
     }
 
     @Test

@@ -37,9 +37,8 @@ data class BegodeWriteStep(
  * ## No acknowledgement
  *
  * The wheel never confirms a write. The only way to know a setting took is to read it back
- * out of the ordinary telemetry stream, which is why [BegodeProtocolEngine] now keeps the
- * tilt-back speed, the auto power-off timer, the unit flag and the light mode that frame
- * `type=4 page=24` has been carrying all along.
+ * out of the ordinary telemetry stream, which is why [BegodeProtocolEngine] keeps every
+ * setting the frames carry; [BegodeSettingsCatalog] lists which rows that covers.
  */
 @ExperimentalWriteApi
 object BegodeSettingsWriter {
@@ -205,6 +204,15 @@ object BegodeSettingsWriter {
      * came from it expect the sound.
      */
     fun beep(): List<BegodeWriteStep> = single('b')
+
+    /**
+     * The horn as one ready-to-write frame: the [beep] byte on its own.
+     *
+     * The same byte the official app's horn button sends, and the same byte [beep] schedules;
+     * this form exists for a caller that writes one frame rather than a paced sequence, such
+     * as a quick-action button. A single byte needs no pause after it to be read correctly.
+     */
+    fun horn(): ByteArray = byteArrayOf(BeepLetter)
 
     /**
      * A settings sequence plus the beep that tells the rider the wheel heard it.

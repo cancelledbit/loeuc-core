@@ -10,6 +10,50 @@ import kotlin.test.assertTrue
 
 class LeaperKimProtocolEngineTest {
     @Test
+    fun legacyShermanMaxUsesItsOwnTorqueAxisInBothTravelDirections() {
+        val legacy = "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1".decodeHex()
+        for (direction in listOf(-1, 1)) {
+            val driving = legacy.copyOf().apply {
+                putInt16Be(6, direction * 394)
+                putInt16Be(16, direction * 1614)
+                putUInt16Be(4, 9145)
+                putUInt16Be(34, 6770)
+            }
+            val engine = LeaperKimProtocolEngine()
+            assertEquals(9992.54031, assertNotNull(engine.consume(driving)).power, 0.001)
+            val braking = driving.copyOf().apply { putInt16Be(16, -direction * 1614) }
+            assertEquals(-9992.54031, assertNotNull(engine.consume(braking)).power, 0.001)
+            val stopped = braking.copyOf().apply { putInt16Be(6, 0) }
+            assertTrue(assertNotNull(engine.consume(stopped)).power > 0.0)
+        }
+    }
+
+    @Test
+    fun rejectsImpossibleLegacyDutyAndPoseWithoutChangingLatestFrame() {
+        val legacy = "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1".decodeHex()
+        val engine = LeaperKimProtocolEngine()
+        assertNotNull(engine.consume(legacy))
+        assertNull(engine.consume(legacy.copyOf().apply { putUInt16Be(34, 19464) }))
+        assertNull(engine.consume(legacy.copyOf().apply {
+            putInt16Be(32, 23584)
+            putUInt16Be(34, 9473)
+        }))
+        assertEquals(2.09, assertNotNull(engine.consume(legacy)).pwmPercent, 0.001)
+    }
+
+    @Test
+    fun legacyLostTailDoesNotConsumeTheFollowingFrameHeader() {
+        val legacy = "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1".decodeHex()
+        // The 2026-10-24 corrupt sample has 0x5C20 at pose and the next voltage at PWM.
+        val reassembler = LeaperKimFrameReassembler()
+        assertTrue(reassembler.consume(legacy.copyOfRange(0, 30)).isEmpty())
+        assertTrue(reassembler.consume(legacy.copyOfRange(0, 20)).isEmpty())
+        val recovered = reassembler.consume(legacy.copyOfRange(20, 36)).single()
+        assertTrue(legacy.contentEquals(recovered))
+        assertEquals(2.09, assertNotNull(LeaperKimProtocolEngine().consume(recovered)).pwmPercent, 0.001)
+    }
+
+    @Test
     fun reassemblesNotificationsAndKeepsPageState() {
         val engine = LeaperKimProtocolEngine()
         val page2 = frame(page = 2).apply {
@@ -38,6 +82,25 @@ class LeaperKimProtocolEngineTest {
     }
 
     @Test
+    fun brakeOverpressureAlarmIsHiddenEvenWhenTheWheelReportsIt() {
+        val engine = LeaperKimProtocolEngine()
+        val page8 = frame(page = 8).apply {
+            (47 until size).forEach { index -> this[index] = 0x80.toByte() }
+            this[50] = 72
+            this[69] = 95
+        }.withUpdatedCrc()
+
+        engine.consume(page8)
+
+        // Nobody can say what id 34 does, so it is kept out of every list: still in the full
+        // catalogue, which keeps its shape, but never supported, displayed or written.
+        val hidden = engine.allSettingsCapabilities().single { it.key == "brake_overpressure_alarm" }
+        assertEquals(false, hidden.isSupported)
+        assertEquals(listOf("pedal_hardness"), engine.settingsCapabilities().map { it.key })
+        assertNull(engine.buildSettingCommand("brake_overpressure_alarm", 100))
+    }
+
+    @Test
     fun page8DiscoversCapabilitiesAndBuildsValidatedCommand() {
         val engine = LeaperKimProtocolEngine()
         val page8 = frame(page = 8).apply {
@@ -58,6 +121,81 @@ class LeaperKimProtocolEngineTest {
             "4C6441701201028080808080805ACC4D87F6",
             engine.buildSettingCommand("stop_power", 90)?.hex(),
         )
+    }
+
+    /**
+     * Page 8 byte 65 is the max-charge base voltage, and 0x80 there means "not reported", exactly
+     * as on every other page-8 byte. The Lynx-S reports 145; the NOSFET Apex hardcodes 0x80, and
+     * the settings capability used to hand that out as a base of 128, so the Apex's stock raw 62
+     * (151.2 V per its firmware, `docs/nosfet-firmware-re-notes.md`) was labelled 134.2 V.
+     *
+     * Fixtures are verbatim page-8 captures: Lynx-S from
+     * loeuc_882583F62376_unknown_20260812_163536.jsonl, Apex (NF0126, firmware 501.0.08) from
+     * loeuc_882583F58B05_unknown_20260804_165936.jsonl.
+     */
+    @Test
+    fun maxChargeBaseHonoursTheNotReportedSentinel() {
+        val apex = LeaperKimProtocolEngine()
+        val apexTelemetry = assertNotNull(apex.consume(NOSFET_APEX_PAGE_8.decodeHex()))
+        assertEquals(501008.0, apexTelemetry.firmwareVersion)
+        val apexCharge = assertNotNull(apex.allSettingsCapabilities().firstOrNull { it.key == "max_charge_voltage" })
+        assertEquals(62, apexCharge.rawValue)
+        // Not on the wire, but known for this build from its firmware.
+        assertEquals(145, apexCharge.baseValue)
+        assertEquals(151.2, apex.bmsSnapshot().batteries.first().maxChargeVoltage, 1e-9)
+
+        val lynxS = LeaperKimProtocolEngine()
+        lynxS.consume(LYNX_S_PAGE_8.decodeHex())
+        val lynxCharge = assertNotNull(lynxS.allSettingsCapabilities().firstOrNull { it.key == "max_charge_voltage" })
+        assertEquals(50, lynxCharge.rawValue)
+        assertEquals(145, lynxCharge.baseValue)
+        assertEquals(150.0, lynxS.bmsSnapshot().batteries.first().maxChargeVoltage, 1e-9)
+    }
+
+    /**
+     * A wheel that sends no base on a build whose base is not established gets no voltage at
+     * all - not 145, and not a base derived from its series: the same 36S Lynx-S reports 146 on
+     * 009.0.03 and 145 on 009.0.04. The settings row and the telemetry agree on "unknown".
+     *
+     * The Apex capture with its firmware bytes changed to 501.0.07, a build nothing here has read.
+     */
+    @Test
+    fun maxChargeVoltageIsUnknownWhenNeitherTheWireNorTheBuildGivesABase() {
+        val unknownBuild = NOSFET_APEX_PAGE_8.decodeHex().apply {
+            this[29] = 0x0F // 501008 = 07 A5 10 in bytes 30, 28, 29; one build earlier
+        }.withUpdatedCrc()
+        val engine = LeaperKimProtocolEngine()
+        val telemetry = assertNotNull(engine.consume(unknownBuild))
+        assertEquals(501007.0, telemetry.firmwareVersion)
+        val charge = assertNotNull(engine.allSettingsCapabilities().firstOrNull { it.key == "max_charge_voltage" })
+        assertTrue(charge.isSupported)
+        assertEquals(62, charge.rawValue)
+        assertNull(charge.baseValue)
+        assertTrue(engine.bmsSnapshot().batteries.first().maxChargeVoltage.isNaN())
+    }
+
+    @Test
+    fun maxChargeBaseResolution() {
+        // The wire always wins, even over a build whose base is known.
+        assertEquals(168, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = 168, firmwareVersion = 9004))
+        assertEquals(146, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 9003))
+        assertEquals(145, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 9004))
+        assertEquals(168, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 8005))
+        assertEquals(145, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 501008))
+        // Lynx (0050) 005.0.12, Sherman-L 006.0.10, Patton-S 007.0.03: from each image's setter.
+        assertEquals(145, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 5012))
+        assertEquals(145, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 6010))
+        assertEquals(121, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 7003))
+        // Every Lynx build takes the model's base, including images without a readable setter.
+        assertEquals(145, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 5007))
+        assertEquals(145, LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 5010))
+        // Sherman S (003) has no setter of that shape in any image: unknown.
+        assertNull(LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = 3015))
+        assertNull(LeaperKimMaxChargeVoltage.baseVolts(reportedBase = null, firmwareVersion = null))
+
+        assertEquals(151.2, assertNotNull(LeaperKimMaxChargeVoltage.volts(145, 62)), 1e-9)
+        assertEquals(176.4, assertNotNull(LeaperKimMaxChargeVoltage.volts(168, 84)), 1e-9)
+        assertNull(LeaperKimMaxChargeVoltage.volts(null, 62))
     }
 
     /**
@@ -552,6 +690,83 @@ class LeaperKimProtocolEngineTest {
     }
 
     @Test
+    fun zeroTemperatureDropoutDoesNotReplaceWarmSensors() {
+        val engine = LeaperKimProtocolEngine()
+        engine.consume(LYNX_S_PAGE_3_WARM.decodeHex())
+        val dropout = LYNX_S_PAGE_3_WARM.decodeHex().apply {
+            repeat(6) { putInt16Be(47 + it * 2, 0) }
+        }.withUpdatedCrc()
+
+        val telemetry = assertNotNull(engine.consume(dropout))
+        assertEquals(22.32, telemetry.batteryTemperatureMin, 0.001)
+        assertEquals(23.60, telemetry.batteryTemperatureMax, 0.001)
+        assertEquals(6, engine.bmsSnapshot().batteries[0].temperatures.size)
+    }
+
+    @Test
+    fun realFreezingTemperaturesRemainAvailable() {
+        val engine = LeaperKimProtocolEngine()
+        for (hundredths in listOf(400, 0, -100, 0)) {
+            val cold = LYNX_S_PAGE_3_WARM.decodeHex().apply {
+                repeat(6) { putInt16Be(47 + it * 2, hundredths) }
+            }.withUpdatedCrc()
+            val telemetry = assertNotNull(engine.consume(cold))
+            assertEquals(hundredths / 100.0, telemetry.batteryTemperatureMin, 0.001)
+            assertEquals(hundredths / 100.0, telemetry.batteryTemperatureMax, 0.001)
+        }
+    }
+
+    @Test
+    fun shermanPFieldWeakeningUsesItsOwnFirmwareCalibration() {
+        assertEquals(48.0, calculateLeaperKimFieldWeakening(150.0, false, "0100", 10002)!!, 0.0001)
+        assertEquals(92.0, calculateLeaperKimFieldWeakening(176.4, false, "0100", 10002)!!, 0.0001)
+        assertEquals(70.0, calculateLeaperKimFieldWeakening(176.4, true, "0100", 10002)!!, 0.0001)
+        assertNull(calculateLeaperKimFieldWeakening(176.4, false, "0100", 10003))
+    }
+
+    @Test
+    fun shermanPIdentifiesIts42sPackEvenAtLowVoltageBeforeBmsPagesArrive() {
+        fun main(version: Int) = frame(page = 0).apply {
+            this[30] = (version ushr 16).toByte()
+            this[28] = (version ushr 8).toByte()
+            this[29] = version.toByte()
+            putUInt16Be(4, 14_000)
+        }.withUpdatedCrc()
+
+        val engine = LeaperKimProtocolEngine()
+        val telemetry = assertNotNull(engine.consume(main(10_002)))
+        val oryx = assertNotNull(LeaperKimProtocolEngine().consume(main(8_002)))
+        assertEquals("0100", telemetry.hardwareCode)
+        assertEquals("Sherman-P", engine.modelName())
+        assertEquals(140.0, telemetry.voltage)
+        assertEquals(oryx.batteryPercent, telemetry.batteryPercent)
+        assertTrue(telemetry.batteryPercent < 20.0)
+        val bms = engine.bmsSnapshot()
+        assertEquals("leaperkim_0100", bms.profileId)
+        assertEquals("Sherman-P", bms.modelName)
+        assertEquals(6, bms.batteries.sumOf { it.parallelStrings })
+        assertEquals(2, bms.batteries.size)
+        bms.batteries.forEach {
+            assertEquals(42, it.expectedCellCount)
+            assertEquals(3, it.parallelStrings)
+        }
+
+        // Both batteries must retain cells 37..42 even before a page announces the cell count.
+        for (page in listOf(3, 7)) {
+            engine.consume(frame(page = page, size = 100).apply {
+                this[28] = (10_002 ushr 8).toByte()
+                this[29] = 10_002.toByte()
+                repeat(12) { putUInt16Be(59 + it * 2, 3_600 + it) }
+            }.withUpdatedCrc())
+        }
+        engine.bmsSnapshot().batteries.forEach {
+            assertEquals(12, it.cells.size)
+            assertEquals(42, it.cells.last().index)
+            assertEquals(3.611, it.cells.last().voltage, 0.0001)
+        }
+    }
+
+    @Test
     fun recognizesNosfetApexBmsProfile() {
         val engine = LeaperKimProtocolEngine()
         val page1 = frame(page = 1).apply {
@@ -566,6 +781,25 @@ class LeaperKimProtocolEngineTest {
         assertEquals("Nosfet Apex", bms.modelName)
         assertEquals(2, bms.batteries.size)
         assertEquals(36, bms.batteries[0].expectedCellCount)
+        assertEquals(2, bms.batteries[0].parallelStrings) // 4P total / 2 batteries
+    }
+
+    @Test
+    fun recognizesNosfetXenoBmsProfile() {
+        val engine = LeaperKimProtocolEngine()
+        val page1 = frame(page = 1).apply {
+            this[30] = 7 // versionNumber 504005 = 0x07B0C5
+            this[28] = 0xB0.toByte()
+            this[29] = 0xC5.toByte()
+        }.withUpdatedCrc()
+        engine.consume(page1)
+
+        val bms = assertNotNull(engine.bmsSnapshot())
+        assertEquals("nosfet_5040", bms.profileId)
+        assertEquals("Nosfet Xeno", bms.modelName)
+        assertEquals("Xeno", engine.modelName())
+        assertEquals(2, bms.batteries.size)
+        assertEquals(30, bms.batteries[0].expectedCellCount)
         assertEquals(2, bms.batteries[0].parallelStrings) // 4P total / 2 batteries
     }
 
@@ -683,6 +917,180 @@ class LeaperKimProtocolEngineTest {
         val lynxS = LeaperKimProtocolEngine()
         lynxS.consume(LYNX_S_PAGE_0.decodeHex())
         assertFalse(lynxS.usesTextLightCommand())
+    }
+
+    /**
+     * Turning the light off sends both spellings; turning it on sends the frame alone.
+     *
+     * The asymmetry is the point, not an oversight. Off means the same zero in the same light-mode
+     * byte whichever spelling arrives, so both can go out and the wheel obeys the one it parses -
+     * on an old Lynx the frame alone lit the headlight but never put it out. On cannot be doubled
+     * on a Lynx-S, where the frame's setter stores `v * 2`: there the text is mode 1 and the frame
+     * mode 2, the dim and the bright beam, and sending both would ask for two different lights.
+     */
+    @Test
+    fun theLightGoesOutInBothSpellingsAndComesOnInOne() {
+        val engine = LeaperKimProtocolEngine()
+
+        val on = engine.lightCommand(enabled = true)
+        val off = engine.lightCommand(enabled = false)
+
+        assertTrue(on.contentEquals(engine.buildLightCommand(enabled = true)))
+        assertTrue(
+            off.contentEquals(
+                engine.buildLightCommand(enabled = false) +
+                    buildLeaperKimLowLightCommand(enabled = false),
+            ),
+        )
+        // Spelled out rather than only compared: the text tail is what the fix added, and a
+        // builder that stopped appending it would still satisfy a comparison against itself.
+        assertEquals("SetLightOFF", off.decodeToString(off.size - 11))
+    }
+
+    /** The four text-only codes have no frame to send, so both directions stay text. */
+    @Test
+    fun aTextOnlyWheelTakesTextInBothDirections() {
+        val shermanMax = LeaperKimProtocolEngine()
+        shermanMax.consume(
+            "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1".decodeHex(),
+        )
+        assertTrue(shermanMax.usesTextLightCommand())
+
+        assertEquals("SetLightON", shermanMax.lightCommand(enabled = true).decodeToString())
+        assertEquals("SetLightOFF", shermanMax.lightCommand(enabled = false).decodeToString())
+    }
+
+    /**
+     * The horn is the horn frame wherever that frame can be dispatched, and nothing on the four
+     * text-only hardware codes, which have no handler for it.
+     */
+    @Test
+    fun theHornIsTheHornFrameExceptOnTextOnlyWheels() {
+        val fresh = LeaperKimProtocolEngine()
+        val freshHorn = assertNotNull(fresh.hornCommand())
+        assertTrue(freshHorn.contentEquals(fresh.buildHornCommand()))
+
+        val lynxS = LeaperKimProtocolEngine()
+        lynxS.consume(LYNX_S_PAGE_0.decodeHex())
+        val lynxSHorn = assertNotNull(lynxS.hornCommand())
+        assertTrue(lynxSHorn.contentEquals(lynxS.buildHornCommand()))
+
+        val shermanMax = LeaperKimProtocolEngine()
+        shermanMax.consume(
+            "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1".decodeHex(),
+        )
+        assertTrue(shermanMax.usesTextLightCommand())
+        assertNull(shermanMax.hornCommand())
+    }
+
+    /**
+     * The horn's exact bytes, CRC included.
+     *
+     * The CRC is worth pinning here rather than recomputing in the assertion, because it is the
+     * one part a refactor can silently get wrong - wrong polynomial, wrong byte order, or a CRC
+     * taken over the wrong slice. The two expected values were produced independently with
+     * `zlib.crc32` and the same routine reproduces the two light frames the firmware notes record
+     * from a real wheel (`4C6B41700D0180800157ED3BD5`), so the encoding is anchored to observed
+     * traffic and not only to this engine.
+     *
+     * `packet[5]` is the part that matters for behaviour: `0x63` on the `LdAp` half asks the wheel
+     * for 450 ms at loudness 900, and `0x01` on the `LkAp` half keeps that frame's identity intact
+     * on the older wheels. Slot 16 of the `LkAp` half must stay `0x80` - with `0x01` there it is
+     * the vendor's "shut down in ten seconds" packet.
+     */
+    @Test
+    fun theHornFrameAsksForTheLongLoudBeepAndCarriesAValidCrc() {
+        val horn = LeaperKimProtocolEngine().buildHornCommand()
+
+        assertEquals(44, horn.size)
+        assertEquals(
+            "4C6B41701601808080808080808080808080FBF6B828",
+            horn.copyOfRange(0, 22).hex(),
+        )
+        assertEquals(
+            "4C6441701663008080808080808080808080331C8B08",
+            horn.copyOfRange(22, 44).hex(),
+        )
+
+        // The beep request, stated as such so a change to it fails loudly.
+        assertEquals(0x63, horn[27].toInt() and 0xFF, "LdAp packet[5] is the horn's beep code")
+        assertEquals(0x01, horn[5].toInt() and 0xFF, "LkAp packet[5] keeps the frame's identity")
+        // One byte away from CMD_SET_CLOSE_IN_10; it must not drift to 0x01.
+        assertEquals(0x80, horn[16].toInt() and 0xFF, "LkAp slot 16 is not the shutdown trigger")
+    }
+
+    /**
+     * The trip reset's exact bytes, CRC included.
+     *
+     * Both halves are the vendor app's own constants (`BtManager.CMD_CLEAR_METER` and
+     * `CMD_CLEAR_METER_NEW`), and the CRCs are pinned rather than recomputed for the same reason as
+     * the horn's: a refactor that breaks the polynomial or the byte order is exactly what this
+     * assertion is for. They were produced independently with `zlib.crc32`.
+     *
+     * The `0x01` in the last slot of the `LdAp` half is the whole command: the firmware's
+     * `triggerClearTripOrCallback` acts on that value and no other.
+     */
+    @Test
+    fun theTripResetFrameCarriesBothVendorSpellingsAndAValidCrc() {
+        val reset = LeaperKimProtocolEngine().buildClearTripCommand()
+
+        assertEquals(24, reset.size)
+        assertEquals("4C6B4170FB0001BCCE4228", reset.copyOfRange(0, 11).hex())
+        assertEquals("4C6441700D00028001D4C081F2", reset.copyOfRange(11, 24).hex())
+
+        assertEquals(0x02, reset[17].toInt() and 0xFF, "LdAp body[1] selects the page-8 branch")
+        assertEquals(0x01, reset[19].toInt() and 0xFF, "LdAp body[3] is the clear-trip trigger")
+    }
+
+    /**
+     * The trip reset follows the horn's rule: nothing on the four text-only hardware codes, which
+     * dispatch neither spelling, and the frame everywhere else.
+     */
+    @Test
+    fun theTripResetIsOfferedOnlyWhereTheFrameCanBeDispatched() {
+        val fresh = LeaperKimProtocolEngine()
+        val freshReset = assertNotNull(fresh.clearTripCommand())
+        assertTrue(freshReset.contentEquals(fresh.buildClearTripCommand()))
+
+        val lynxS = LeaperKimProtocolEngine()
+        lynxS.consume(LYNX_S_PAGE_0.decodeHex())
+        assertNotNull(lynxS.clearTripCommand())
+
+        val shermanMax = LeaperKimProtocolEngine()
+        shermanMax.consume(
+            "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1".decodeHex(),
+        )
+        assertNull(shermanMax.clearTripCommand())
+    }
+
+    /**
+     * Only the horn shouts. Every other command keeps the quiet acknowledgement beep.
+     *
+     * `packet[5]` is read by the wheel before it looks at which command the frame carries, so it
+     * would be easy to raise it everywhere and turn each settings write into a blast. These are
+     * the frames that must stay at `0x01`.
+     */
+    @Test
+    fun lightAndSettingsFramesKeepTheQuietAcknowledgementBeep() {
+        val engine = LeaperKimProtocolEngine()
+
+        val light = engine.buildLightCommand(enabled = true)
+        assertEquals(0x01, light[5].toInt() and 0xFF, "LkAp light keeps the quiet beep")
+        assertEquals(0x01, light[18].toInt() and 0xFF, "LdAp light keeps the quiet beep")
+
+        val shutdown = engine.buildFixedShutdownTimerCommand()
+        assertEquals(0x80, shutdown[5].toInt() and 0xFF, "shutdown timer keeps its own body[0]")
+
+        // A settings write needs a page 8 first, or the capability is not supported and there is
+        // no command to build.
+        engine.consume(
+            frame(page = 8).apply {
+                (47 until size).forEach { index -> this[index] = 0x80.toByte() }
+                this[53] = 85.toByte()
+            }.withUpdatedCrc(),
+        )
+        val setting = assertNotNull(engine.buildSettingCommand("stop_power", 90))
+        assertEquals(0x01, setting[5].toInt() and 0xFF, "settings writes keep the quiet beep")
     }
 
     @Test
@@ -822,6 +1230,42 @@ class LeaperKimProtocolEngineTest {
 
         assertEquals(25.0, telemetry.speedKmh, 0.01)
         assertTrue(telemetry.power > 0.0, "reverse under power still draws, was ${telemetry.power}")
+        assertEquals(-25.0, telemetry.signedSpeedKmh, 0.01)
+        assertEquals(48.0, telemetry.signedPhaseCurrent, 0.01)
+    }
+
+    /**
+     * A real Sherman-L page 6 frame (hardware `0060`), taken while a lifted wheel spun up under
+     * full output: speed `+2.2`, torque current `-92.2 A` and `@38 = 0x0279`. The magnitudes stay
+     * what the dashboard always showed; the signed fields and the raw halfword ride alongside.
+     */
+    @Test
+    fun publishesSignedSpeedAndCurrentAndTheRawInputCurrentWord() {
+        val engine = LeaperKimProtocolEngine()
+        val frame = (
+            "DC5A5C532D400016DFA500038140005AFC6611C40384000003840352177A0080FD591A4580C80279" +
+                "808080808080068080808080800D1F0D1B0D1F0D260D260D170D330D310D390D2F0D2D0D2D0D23" +
+                "0D420D42622AA5F9"
+            ).decodeHex()
+
+        val telemetry = assertNotNull(engine.consume(frame))
+
+        assertEquals(2.2, telemetry.speedKmh, 0.01)
+        assertEquals(2.2, telemetry.signedSpeedKmh, 0.01)
+        assertEquals(92.2, telemetry.phaseCurrent, 0.01)
+        assertEquals(-92.2, telemetry.signedPhaseCurrent, 0.01)
+        assertEquals(633.0, telemetry.inputCurrentRaw, 0.01)
+    }
+
+    @Test
+    fun legacyFramesCarryNoInputCurrentWord() {
+        val engine = LeaperKimProtocolEngine()
+        val legacy = "DC5A5C20242F00005D60000142AD008B00320E940E1000000AF0024604530002005D00D1"
+
+        val telemetry = assertNotNull(engine.consume(legacy.decodeHex()))
+
+        assertEquals(5.0, telemetry.signedPhaseCurrent, 0.01)
+        assertTrue(telemetry.inputCurrentRaw.isNaN())
     }
 }
 
@@ -889,6 +1333,9 @@ private const val LYNX_S_PAGE_5 =
 private const val PATTON_PAGE_4_TILTED =
     "DC5A5C4530540000EE48001BEE48001B00000DDC0D51000007D003200FB1000219CE0000006F00008080808080800" +
         "4000335FFFFFFFFFF32EEFD2109AB12C903D00000FFE0C78E511A"
+
+private const val NOSFET_APEX_PAGE_8 =
+    "DC5A5C4635F500009F620022A3B4003D004B0F9B04AF000003E807D0A51007A1FF73017480C80000808080808080080000803DEEC85A6464000000008080320F3E80288080808A89DC8B"
 
 private const val LYNX_S_PAGE_8 =
     "DC5A5C4737190000DF6C00007042000300080C8A0379000003C002EE232C00780006007D80C800008080808080800800008014004B56603C000000000001280432915A801E8080C9E81C4B"

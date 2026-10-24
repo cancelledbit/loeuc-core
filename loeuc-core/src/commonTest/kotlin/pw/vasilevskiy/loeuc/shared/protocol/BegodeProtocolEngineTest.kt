@@ -3,6 +3,7 @@ package pw.vasilevskiy.loeuc.shared.protocol
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class BegodeProtocolEngineTest {
@@ -32,7 +33,8 @@ class BegodeProtocolEngineTest {
 
         assertFalse(telemetry.isLegacy)
         assertEquals(122.0, telemetry.voltage, 0.0001)
-        assertEquals(-2.5, telemetry.current, 0.0001)
+        // The wire word is -250: a draw, which the engine publishes as a positive current.
+        assertEquals(2.5, telemetry.current, 0.0001)
         assertEquals(73.0, telemetry.pwmPercent, 0.0001)
     }
 
@@ -57,7 +59,8 @@ class BegodeProtocolEngineTest {
         engine.consume(main)
         val telemetry = requireNotNull(engine.consume(power))
 
-        assertEquals(-4.78, telemetry.current, 0.0001)
+        // -478 on the wire while the wheel pulls away: the pack is driving, so the current is positive.
+        assertEquals(4.78, telemetry.current, 0.0001)
         assertEquals(138.9, telemetry.phaseCurrent, 0.0001)
         assertEquals(12.0, telemetry.pwmPercent, 0.0001)
         assertEquals(33.2035, telemetry.temperature, 0.0001)
@@ -295,8 +298,8 @@ class BegodeProtocolEngineTest {
     @Test
     fun aTiltbackSpeedNobodyRidesAtMeansOffRatherThanUnknown() {
         val engine = BegodeProtocolEngine()
-        // Настройки читает только современный разбор, а он включается кадром опознания:
-        // 100.8 В в поле пакета - поток не наследный.
+        // Settings are only read by the modern parse, and an identification frame turns it on:
+        // 100.8 V in the packet field means the stream is not the legacy one.
         engine.consume(
             begodeFrame(type = 1, page = 0).apply {
                 putUInt16Be(offset = 6, value = 1_008)
@@ -307,7 +310,7 @@ class BegodeProtocolEngineTest {
         }
 
         val telemetry = requireNotNull(engine.consume(status))
-        assertTrue(!telemetry.isLegacy, "кадр должен разобраться современным путём")
+        assertTrue(!telemetry.isLegacy, "the frame has to be parsed the modern way")
         assertEquals(0.0, telemetry.tiltbackSpeedKmh, 0.0001)
         assertTrue(BegodeTelemetry().tiltbackSpeedKmh.isNaN())
     }
@@ -531,12 +534,12 @@ class BegodeProtocolEngineTest {
     }
 
     @Test
-    fun legacyBegodeKeepsPhaseCurrentAndApparentPowerAsMagnitudes() {
+    fun legacyBegodeKeepsPhaseCurrentMagnitudeAndSignedApparentPower() {
         val telemetry = requireNotNull(BegodeProtocolEngine().consume(legacyBraking))
 
         assertTrue(telemetry.phaseCurrent > 0.0, "phase current is effort, not direction")
-        assertTrue(telemetry.apparentPower > 0.0, "apparent power is a magnitude by definition")
-        assertEquals(telemetry.apparentPower, -telemetry.power, 0.0001)
+        assertTrue(telemetry.apparentPower < 0.0, "legacy VA must show regeneration")
+        assertEquals(telemetry.power, telemetry.apparentPower, 0.0001)
     }
 
     @Test
@@ -546,6 +549,137 @@ class BegodeProtocolEngineTest {
         assertEquals(0.0, telemetry.speedKmh, 0.0001)
         assertTrue(telemetry.power >= 0.0, "a balancing wheel draws, was ${telemetry.power}")
     }
+
+    /**
+     * Battery current and power on a modern Begode are positive while the pack drives the motor.
+     *
+     * Real frames from capture `385CFBC9BF07/20260727_084903` (Begode Master, stock firmware),
+     * the strongest draw of the ride: `type=7 @2` reads -22.83 A at 26 km/h, with a phase current
+     * that agrees with the speed. Published as read, a whole ride of these integrated to a
+     * negative consumption.
+     */
+    @Test
+    fun modernBegodeHardDrawReportsPowerLeavingThePack() {
+        val telemetry = consumeAll(BegodeProtocolEngine(), modernDrawBattery, modernDrawMain, modernDrawPower)
+
+        assertFalse(telemetry.isLegacy)
+        assertEquals(26.28, telemetry.speedKmh, 0.0001)
+        assertEquals(120.9, telemetry.voltage, 0.0001)
+        assertEquals(22.83, telemetry.current, 0.0001)
+        assertEquals(120.9 * 22.83, telemetry.power, 0.01)
+        assertEquals(120.9 * 22.83, telemetry.apparentPower, 0.01)
+    }
+
+    /** The strongest return of the same ride: `@2` reads +7.53 A at 30 km/h, phase current against the speed. */
+    @Test
+    fun modernBegodeBrakingReportsPowerReturningToThePack() {
+        val telemetry = consumeAll(BegodeProtocolEngine(), modernReturnBattery, modernReturnMain, modernReturnPower)
+
+        assertEquals(-7.53, telemetry.current, 0.0001)
+        assertEquals(-122.5 * 7.53, telemetry.power, 0.01)
+        assertEquals(122.5 * 7.53, telemetry.apparentPower, 0.01, "apparent power is a magnitude by definition")
+    }
+
+    /**
+     * The flip agrees with the phase-current convention established on its own evidence: the same
+     * real main frame decoded on its own, through the legacy path, gives the same power direction
+     * as the modern battery current that arrived with it.
+     */
+    @Test
+    fun modernBatteryCurrentAgreesWithThePhaseCurrentConventionOnTheSameFrames() {
+        val draw = consumeAll(BegodeProtocolEngine(), modernDrawBattery, modernDrawMain, modernDrawPower)
+        val drawPhase = requireNotNull(BegodeProtocolEngine().consume(modernDrawMain))
+        val back = consumeAll(BegodeProtocolEngine(), modernReturnBattery, modernReturnMain, modernReturnPower)
+        val backPhase = requireNotNull(BegodeProtocolEngine().consume(modernReturnMain))
+
+        assertTrue(drawPhase.isLegacy && backPhase.isLegacy)
+        assertTrue(drawPhase.power > 0.0 && draw.power > 0.0, "draw: ${drawPhase.power} / ${draw.power}")
+        assertTrue(backPhase.power < 0.0 && back.power < 0.0, "return: ${backPhase.power} / ${back.power}")
+    }
+
+    private val modernDrawBattery = hex("55 AA 00 5A 00 00 04 B9 FF F0 00 18 00 17 02 6A 7D 01 01 00 5A 5A 5A 5A")
+    private val modernDrawMain = hex("55 AA 17 84 FD 26 00 50 0A 86 F2 40 F8 42 10 89 00 08 00 18 5A 5A 5A 5A")
+    private val modernDrawPower = hex("55 AA F7 15 00 00 00 22 00 24 00 00 00 00 00 00 00 00 07 18 5A 5A 5A 5A")
+    private val modernReturnBattery = hex("55 AA 00 5A 00 00 04 C9 FF D9 00 18 00 17 02 63 7D 01 01 00 5A 5A 5A 5A")
+    private val modernReturnMain = hex("55 AA 17 F2 FC C6 00 59 06 4F 0A F0 F9 E2 10 89 00 08 00 18 5A 5A 5A 5A")
+    private val modernReturnPower = hex("55 AA 02 F1 00 00 00 1E 00 17 00 00 00 00 00 00 00 00 07 18 5A 5A 5A 5A")
+
+    // One frame of each type from a RACE capture (`7A1371_184024`), the one wheel in the dumps
+    // whose settings fields are all away from zero. Its `type=0` voltage reads the legacy way,
+    // and it sends no `type=1`, so `type=4` goes through the legacy status parse.
+    private val raceLive = hex("55 AA 1A 26 00 00 00 AE 00 1E 00 AA 02 D4 10 C1 00 09 00 18 5A 5A 5A 5A")
+    private val raceStatus = hex("55 AA 00 3A 24 C3 29 00 1C 20 00 C8 00 01 00 00 00 12 04 18 5A 5A 5A 5A")
+    private val racePower = hex("55 AA 00 9A 00 62 00 1B 00 01 FF EE 00 14 00 00 00 00 07 18 5A 5A 5A 5A")
+
+    /**
+     * The settings a RACE reports, read where WheelHUD reads them. Every value here held for the
+     * whole capture.
+     */
+    @Test
+    fun theSettingsAWheelReportsAreReadBackFromItsFrames() {
+        val telemetry = consumeAll(BegodeProtocolEngine(), racePower, raceLive, raceStatus)
+
+        assertEquals(1.0, telemetry.rideMode, 0.0)
+        assertEquals(0.0, telemetry.tiltbackSpeedKmh, 0.0, "200 km/h is the wheel saying off")
+        assertEquals(false, telemetry.usesMiles)
+        assertEquals(2, telemetry.speedAlarmMode)
+        assertEquals(2, telemetry.sideTiltThreshold)
+        assertEquals(1, telemetry.ledMode)
+        assertEquals(6, telemetry.fieldWeakening)
+        assertEquals(2, telemetry.sideTiltAngleIndex)
+        assertEquals(4, telemetry.pedalDip)
+        assertEquals(2, telemetry.pedalTrim)
+        assertEquals(9, telemetry.buzzerVolume)
+    }
+
+    /**
+     * `type=0 @14` and `@17` mean something else until `type=7` has shown the stream is the
+     * modern one: an RS C30 without `type=7` reads volume 12 and a trim of -4 there.
+     */
+    @Test
+    fun theLiveFrameSettingsWaitForTheStatusFrame() {
+        val telemetry = consumeAll(BegodeProtocolEngine(), raceLive)
+
+        assertNull(telemetry.pedalDip)
+        assertNull(telemetry.pedalTrim)
+        assertNull(telemetry.buzzerVolume)
+    }
+
+    /** On Freestyl3r firmware `type=0 @14` is the motor PWM, not the pedal settings. */
+    @Test
+    fun customFirmwarePwmIsNotReadAsPedalSettings() {
+        val engine = BegodeProtocolEngine()
+        engine.consume("CF2002001".encodeToByteArray())
+
+        val telemetry = consumeAll(engine, racePower, raceLive)
+
+        assertNull(telemetry.pedalDip)
+        assertNull(telemetry.pedalTrim)
+    }
+
+    /** A value outside what the field can hold is no reading, not a clamped one. */
+    @Test
+    fun outOfRangeSettingFieldsStayUnknown() {
+        val status = begodeFrame(type = 4, page = 24).apply {
+            this[6] = 0x01 // side-fall level bits = 3
+            this[7] = 0x80.toByte()
+            this[13] = 0x0C // LED mode 12
+        }
+        val power = begodeFrame(type = 7, page = 24).apply { this[5] = 0xAB.toByte() }
+
+        val telemetry = consumeAll(BegodeProtocolEngine(), status, power)
+
+        assertNull(telemetry.sideTiltThreshold)
+        assertNull(telemetry.ledMode)
+        assertNull(telemetry.fieldWeakening)
+        assertNull(telemetry.sideTiltAngleIndex)
+    }
+
+    private fun consumeAll(engine: BegodeProtocolEngine, vararg frames: ByteArray): BegodeTelemetry =
+        frames.map { engine.consume(it) }.last().let(::requireNotNull)
+
+    private fun hex(text: String): ByteArray =
+        text.split(' ').map { it.toInt(16).toByte() }.toByteArray()
 
     /**
      * A wheel that does not fill `type=7` gets the estimate, not a zero.
@@ -576,14 +710,14 @@ class BegodeProtocolEngineTest {
         engine.consume(stubPower)
         val telemetry = requireNotNull(engine.consume(moving))
 
-        assertFalse(telemetry.isLegacy, "колесо остаётся современным")
+        assertFalse(telemetry.isLegacy, "the wheel stays on the modern parse")
         assertTrue(
             telemetry.motorTemperature.isNaN(),
-            "мотор ровно 0.00 C - это незаполненное поле, а не показание, было ${telemetry.motorTemperature}",
+            "a motor temperature of exactly 0.00 C is an unfilled field, not a reading, was ${telemetry.motorTemperature}",
         )
         assertTrue(
             telemetry.pwmPercent > 0.0,
-            "оценка ШИМ должна работать там, где колесо своего не сообщает, было ${telemetry.pwmPercent}",
+            "the PWM estimate has to work where the wheel reports none of its own, was ${telemetry.pwmPercent}",
         )
     }
 

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Deliberately empty. This library is merged into every extension, so anything declared here
+    is declared by every extension. The bind permission in particular must be declared by the
+    host alone: an extension that declared it would be defining the very permission meant to
+    keep impostors out.
+-->
+<manifest />

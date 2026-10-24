@@ -26,6 +26,56 @@ class LeaperKimStrFieldCatalogTest {
     }
 
     @Test
+    fun everyUnitCarriesBothLanguages() {
+        // The unit sits next to the value on screen. It used to exist in Russian only, so an
+        // English interface printed "0.1 км/ч" under an English description.
+        for (field in LeaperKimStrFieldCatalog.all) {
+            assertEquals(
+                field.unitRu == null,
+                field.unitEn == null,
+                "${field.tag} has a unit in one language only",
+            )
+            val en = field.unitEn ?: continue
+            assertTrue(en.isNotBlank(), "${field.tag} has a blank English unit")
+            assertTrue(
+                en.none { it in '\u0400'..'\u04FF' },
+                "${field.tag} English unit is not English: $en",
+            )
+            assertEquals(field.unitRu, field.unit(isRu = true), field.tag)
+            assertEquals(field.unitEn, field.unit(isRu = false), field.tag)
+        }
+    }
+
+    @Test
+    fun theKnownUnitsTranslateTheWayTheDocsSpellThem() {
+        val expected = mapOf(
+            "dKM" to ("0.1 км/ч" to "0.1 km/h"),
+            "AA" to ("0.1 А" to "0.1 A"),
+            "V" to ("В" to "V"),
+            "Cmo" to ("°C" to "°C"),
+            "Wht" to ("Втч" to "Wh"),
+            "01" to ("мВ" to "mV"),
+            "HzPid" to ("Гц" to "Hz"),
+            "SkM" to ("км" to "km"),
+            "Rtc" to ("с" to "s"),
+            "U" to ("%" to "%"),
+            "AQ" to ("А" to "A"),
+        )
+        for ((tag, units) in expected) {
+            val field = assertNotNull(LeaperKimStrFieldCatalog.describe(tag), "$tag is missing")
+            assertEquals(units.first, field.unitRu, tag)
+            assertEquals(units.second, field.unitEn, tag)
+        }
+    }
+
+    @Test
+    fun theDescriptionAccessorFollowsTheLanguageItIsAsked() {
+        val field = assertNotNull(LeaperKimStrFieldCatalog.describe("dKM"))
+        assertEquals(field.ru, field.description(isRu = true))
+        assertEquals(field.en, field.description(isRu = false))
+    }
+
+    @Test
     fun theMeasuredFieldsAreMarkedConfirmed() {
         // These are the ones an actual capture or the firmware settled. If any of them ever slips to
         // a lower confidence the UI would start hedging about things we know.
@@ -91,7 +141,8 @@ class LeaperKimStrFieldCatalogTest {
         for (index in 1..36) {
             val tag = index.toString().padStart(2, '0')
             val field = assertNotNull(LeaperKimStrFieldCatalog.describe(tag), "cell $tag is missing")
-            assertEquals("мВ", field.unit)
+            assertEquals("мВ", field.unitRu)
+            assertEquals("mV", field.unitEn)
         }
     }
 }
