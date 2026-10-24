@@ -1,0 +1,24 @@
+{
+  "id": "example.loeuc.hud",
+  "apiVersion": 1,
+  "version": "1.0",
+  "name": { "en": "HUD bridge" },
+  "summary": { "en": "Mirrors speed, PWM and battery to a BLE head-up display, and turns its button into horn and light." },
+  "needsLocation": false,
+  "telemetryHz": 5,
+  "settings": [
+    { "key": "brightness", "label": { "en": "HUD brightness" }, "unit": "%",
+      "min": 0, "max": 100, "step": 10, "default": 70 }
+  ],
+  "tiles": [
+    { "key": "hud_battery", "label": { "en": "HUD battery" }, "unit": "%",
+      "decimals": 0, "min": 0, "max": 100 }
+  ],
+  "alerts": [
+    { "key": "hud_lost", "text": { "en": "HUD disconnected" }, "persistence": "once" }
+  ],
+  "commands": [
+    { "key": "horn", "label": { "en": "Horn from the HUD button (short press)" }, "action": "horn" },
+    { "key": "light", "label": { "en": "Headlight from the HUD button (long press)" }, "action": "light.toggle" }
+  ]
+}

@@ -63,7 +63,19 @@ build, so it compiles against the contract on every run:
 ./gradlew :examples:android-extension:assembleDebug
 ```
 
-See `docs/extensions.md` for what each part does.
+`examples/android-extension-hud` bridges LoEUC to hardware of your own: telemetry goes out to a
+BLE head-up display five times a second, the display's button comes back as horn (short press)
+and headlight (long press), its battery shows in the Extensions tile, and losing it mid-ride
+raises an alert. `firmware/loeuc_hud/loeuc_hud.ino` is the ESP32 side - flash it, and the
+serial monitor shows the live wheel. The packet format is in `HudPacket.kt` and pinned by
+`HudPacketTest`:
+
+```bash
+./gradlew :examples:android-extension-hud:assembleDebug :examples:android-extension-hud:testDebugUnitTest
+```
+
+See `docs/extensions.md` for what each part does, and its "Bridging to your own hardware"
+section for what carries over to other devices.
 
 ## Android
 

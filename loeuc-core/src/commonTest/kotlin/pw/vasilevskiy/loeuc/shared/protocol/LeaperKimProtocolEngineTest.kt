@@ -1166,7 +1166,7 @@ class LeaperKimProtocolEngineTest {
 
     // `@16` is the q-axis (torque) current, and its sign is load-bearing. Which way round it
     // runs is a property of this firmware's axis convention, not of physics: on Begode agreement
-    // with the speed word means driving, on LeaperKim it means braking. That was established the
+    // with the speed word means driving, on newer CRC32 LeaperKim it means braking. That was established the
     // expensive way - the Begode rule was carried over on the strength of both fields being
     // q-axis currents, and on the first real ride every sign came out backwards.
     //

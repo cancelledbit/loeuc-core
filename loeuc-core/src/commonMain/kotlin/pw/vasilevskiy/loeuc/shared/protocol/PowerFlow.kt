@@ -31,10 +31,11 @@ package pw.vasilevskiy.loeuc.shared.protocol
  * as consumption. The error is not a scale factor: it grows with how much the rider brakes, so it
  * cannot be calibrated away downstream.
  *
- * ## Polarity is per brand, and is not transferable
+ * ## Polarity is per firmware family, and is not transferable
  *
  * Which way round the agreement runs is a property of the firmware's axis convention, not of
- * physics, so it has to be established separately for every brand - see [TorqueSignConvention].
+ * physics, so it has to be established separately for every firmware family - see
+ * [TorqueSignConvention]. Legacy Sherman Max and newer LeaperKim CRC32 frames use opposite axes.
  * Assuming otherwise has already cost one wrong release: LeaperKim's `@16` is a q-axis current
  * just like Begode's `@10`, that likeness was taken for agreement, and on the first real ride
  * every sign came out backwards.
@@ -62,7 +63,7 @@ internal fun powerFlowSign(
  * How this brand's current sign relates to its speed sign.
  *
  * A type rather than a boolean flag, deliberately: this is a firmware convention, established
- * per brand by its own capture, and the caller has to name it out loud instead of inheriting a
+ * per firmware family by its own capture, and the caller has to name it out loud instead of inheriting a
  * default from the neighbour.
  */
 internal enum class TorqueSignConvention {
@@ -70,6 +71,7 @@ internal enum class TorqueSignConvention {
      * Signs agree means the pack is pulling. Established on capture
      * `385CFBC9BF07/20260727_084903`: the share of agreeing samples falls monotonically from 97 %
      * under hard acceleration to 46 % under hard braking.
+     * Also used by the legacy 36-byte Sherman Max stream (LK5690 ride of 2026-10-24).
      */
     AgreementIsDriving,
 

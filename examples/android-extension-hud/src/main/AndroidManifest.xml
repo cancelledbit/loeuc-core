@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Talking to the HUD is this app's own business: LoEUC lends it nothing for that. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name">
+
+        <!-- Runtime permissions need an activity; the service cannot ask for them itself. -->
+        <activity
+            android:name=".SetupActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".HudExtensionService"
+            android:exported="true"
+            android:permission="pw.vasilevskiy.loeuc.permission.BIND_EXTENSION">
+            <intent-filter>
+                <action android:name="pw.vasilevskiy.loeuc.extension.BIND" />
+            </intent-filter>
+            <meta-data
+                android:name="pw.vasilevskiy.loeuc.extension.MANIFEST"
+                android:resource="@raw/loeuc_extension" />
+        </service>
+    </application>
+</manifest>
